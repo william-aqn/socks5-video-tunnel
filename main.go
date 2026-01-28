@@ -8,9 +8,12 @@ import (
 )
 
 type Config struct {
-	CaptureX int `json:"capture_x"`
-	CaptureY int `json:"capture_y"`
-	Margin   int `json:"margin"`
+	CaptureX  int    `json:"capture_x"`
+	CaptureY  int    `json:"capture_y"`
+	Margin    int    `json:"margin"`
+	UseMJPEG  bool   `json:"use_mjpeg"`
+	UseNative bool   `json:"use_native"`
+	VCamName  string `json:"vcam_name"`
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -18,7 +21,10 @@ func loadConfig(filename string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
+	cfg := Config{
+		UseMJPEG:  true,
+		UseNative: true,
+	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
@@ -34,7 +40,7 @@ func saveConfig(filename string, cfg *Config) error {
 }
 
 var (
-	vcam       *WindowsVirtualCamera
+	vcam       VirtualCamera
 	currentCfg *Config
 	cfgFile    string
 )
@@ -46,6 +52,9 @@ func main() {
 	captureY := flag.Int("capture-y", -1, "Y coordinate for screen capture")
 	margin := flag.Int("margin", -1, "Margin from edges for video generation/decoding")
 	useUI := flag.Bool("ui", false, "Use UI to select capture area")
+	useMJPEG := flag.Bool("vcam-mjpeg", true, "Enable MJPEG server")
+	useNative := flag.Bool("vcam-native", true, "Enable native Virtual Camera registration (Windows only)")
+	vcamName := flag.String("vcam-name", "", "Name of the virtual camera")
 
 	flag.Parse()
 
@@ -59,6 +68,20 @@ func main() {
 
 	finalX, finalY := *captureX, *captureY
 	finalMargin := *margin
+	finalUseMJPEG := *useMJPEG
+	finalUseNative := *useNative
+	finalVCamName := *vcamName
+
+	isMJPEGSet := false
+	isNativeSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "vcam-mjpeg" {
+			isMJPEGSet = true
+		}
+		if f.Name == "vcam-native" {
+			isNativeSet = true
+		}
+	})
 
 	// Если в флагах пусто, пробуем из конфига
 	if finalX == -1 && finalY == -1 && loadedCfg != nil {
@@ -72,6 +95,27 @@ func main() {
 			fmt.Printf("Loaded margin from %s: %d\n", cfgFile, finalMargin)
 		} else {
 			finalMargin = 10
+		}
+	}
+	if !isMJPEGSet && loadedCfg != nil {
+		finalUseMJPEG = loadedCfg.UseMJPEG
+		fmt.Printf("Loaded MJPEG setting from %s: %v\n", cfgFile, finalUseMJPEG)
+	}
+	if !isNativeSet && loadedCfg != nil {
+		finalUseNative = loadedCfg.UseNative
+		fmt.Printf("Loaded Native VCam setting from %s: %v\n", cfgFile, finalUseNative)
+	}
+	if finalVCamName == "" && loadedCfg != nil {
+		finalVCamName = loadedCfg.VCamName
+		if finalVCamName != "" {
+			fmt.Printf("Loaded VCam Name from %s: %s\n", cfgFile, finalVCamName)
+		}
+	}
+	if finalVCamName == "" {
+		if *mode == "server" {
+			finalVCamName = "VideoGo Server Camera"
+		} else {
+			finalVCamName = "VideoGo Client Camera"
 		}
 	}
 
@@ -91,15 +135,24 @@ func main() {
 		}
 	}
 
-	currentCfg = &Config{CaptureX: finalX, CaptureY: finalY, Margin: finalMargin}
+	currentCfg = &Config{
+		CaptureX:  finalX,
+		CaptureY:  finalY,
+		Margin:    finalMargin,
+		UseMJPEG:  finalUseMJPEG,
+		UseNative: finalUseNative,
+		VCamName:  finalVCamName,
+	}
 
 	// Сохраняем конфиг, если он изменился или не существовал
-	if loadedCfg == nil || loadedCfg.CaptureX != finalX || loadedCfg.CaptureY != finalY || loadedCfg.Margin != finalMargin {
+	if loadedCfg == nil || loadedCfg.CaptureX != finalX || loadedCfg.CaptureY != finalY ||
+		loadedCfg.Margin != finalMargin || loadedCfg.UseMJPEG != finalUseMJPEG || loadedCfg.UseNative != finalUseNative ||
+		loadedCfg.VCamName != finalVCamName {
 		err := saveConfig(cfgFile, currentCfg)
 		if err != nil {
 			fmt.Printf("Warning: failed to save config: %v\n", err)
 		} else {
-			fmt.Printf("Saved coordinates to %s\n", cfgFile)
+			fmt.Printf("Saved settings to %s\n", cfgFile)
 		}
 	}
 
@@ -121,12 +174,11 @@ func main() {
 	})
 
 	// Инициализируем виртуальную камеру, она нужна в обоих режимах
-	cam, err := NewVirtualCamera(width, height)
+	cam, err := NewVirtualCamera(width, height, finalUseMJPEG, finalUseNative, finalVCamName)
 	if err != nil {
-		fmt.Printf("Warning: Failed to initialize virtual camera: %v\n", err)
-		fmt.Println("Make sure you have a compatible virtual camera driver installed (e.g. UnityCapture)")
+		fmt.Printf("Warning: Failed to initialize virtual camera system: %v\n", err)
 	} else {
-		fmt.Println("Virtual camera initialized.")
+		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
 		defer cam.Close()
 	}

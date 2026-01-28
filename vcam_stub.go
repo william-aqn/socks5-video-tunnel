@@ -8,16 +8,16 @@ import (
 	"image"
 )
 
-type WindowsVirtualCamera struct{}
+type StubVirtualCamera struct{}
 
-func NewVirtualCamera(w, h int) (*WindowsVirtualCamera, error) {
-	return nil, errors.New("virtual camera is only supported on Windows")
+func NewVirtualCamera(w, h int, useMJPEG, useNative bool, name string) (VirtualCamera, error) {
+	return nil, errors.New("virtual camera device is not yet implemented for this platform")
 }
 
-func (c *WindowsVirtualCamera) WriteFrame(img *image.RGBA) error {
+func (c *StubVirtualCamera) WriteFrame(img *image.RGBA) error {
 	return nil
 }
 
-func (c *WindowsVirtualCamera) Close() error {
+func (c *StubVirtualCamera) Close() error {
 	return nil
 }
