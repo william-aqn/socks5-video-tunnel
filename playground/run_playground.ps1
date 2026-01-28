@@ -45,7 +45,8 @@ $ClientDebugY = 0
 $OffsetX = 8
 $OffsetY = 31 + 25 # 56
 
-# Server will capture Client's video automatically by title
+# Server MJPEG will be at 9000, Client at 9001. 
+# Server should WATCH Client (9001), Client should WATCH Server (9000).
 Start-Process $ExePath -ArgumentList "-mode=server", "-vcam-port=$ServerMJPEGPort", "-debug-ui", "-debug-x=$ServerDebugX", "-debug-y=$ServerDebugY", "-debug-url=http://127.0.0.1:$ClientMJPEGPort" -WorkingDirectory $ScriptDir
 
 Write-Host "--- Starting Client ---"

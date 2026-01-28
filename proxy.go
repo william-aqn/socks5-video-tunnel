@@ -15,10 +15,13 @@ import (
 )
 
 const (
-	typeConnect   = 0x00
-	typeConnAck   = 0x01
-	typeData      = 0x02
-	typeHeartbeat = 0x03
+	typeConnect      = 0x00
+	typeConnAck      = 0x01
+	typeData         = 0x02
+	typeHeartbeat    = 0x03
+	typeDisconnect   = 0x04
+	typeSync         = 0x05
+	typeSyncComplete = 0x06
 )
 
 type HeartbeatData struct {
@@ -29,6 +32,28 @@ type HeartbeatData struct {
 	ReceivedFPS  int     `json:"received_fps"` // Скорость, которую я успешно принимаю от тебя
 	Ready        bool    `json:"ready"`        // Готовность к передаче данных
 	SessionID    int64   `json:"sid"`          // Идентификатор сессии
+	Seq          uint32  `json:"seq"`          // Порядковый номер
+	Phase        int     `json:"phase"`        // 0: Normal, 1: Client -> Server test, 2: Server -> Client test
+}
+
+type SyncData struct {
+	SessionID   int64  `json:"sid"`
+	Random      string `json:"rnd"`
+	MeasuredFPS int    `json:"fps,omitempty"`
+}
+
+type SyncCompleteData struct {
+	SessionID int64 `json:"sid"`
+	FPS       int   `json:"fps"`
+}
+
+func generateRandomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
 
 var fpsLevels = []int{1, 5, 10, 20, 25}
@@ -42,18 +67,66 @@ var (
 	lastAvgMs      int
 )
 
+var (
+	sentMu    sync.Mutex
+	sentStats = make(map[byte]int)
+)
+
+func recordSentPacket(t byte) {
+	sentMu.Lock()
+	defer sentMu.Unlock()
+	sentStats[t]++
+}
+
+func getSentStatsAndReset() string {
+	sentMu.Lock()
+	defer sentMu.Unlock()
+	if len(sentStats) == 0 {
+		return "none"
+	}
+	res := ""
+	for t, count := range sentStats {
+		typeName := "unknown"
+		switch t {
+		case typeConnect:
+			typeName = "CONNECT"
+		case typeConnAck:
+			typeName = "ACK"
+		case typeData:
+			typeName = "DATA"
+		case typeHeartbeat:
+			typeName = "HB"
+		case typeSync:
+			typeName = "SYNC"
+		case typeSyncComplete:
+			typeName = "SYNC_DONE"
+		case typeDisconnect:
+			typeName = "DISCONNECT"
+		}
+		res += fmt.Sprintf("%s:%d ", typeName, count)
+		sentStats[t] = 0
+	}
+	return res
+}
+
 type PacketDispatcher struct {
 	mu           sync.RWMutex
 	connChannels map[uint16]chan []byte
 	heartbeatCh  chan []byte
 	connectCh    chan []byte
+	syncCh       chan []byte
+	syncCompCh   chan []byte
+	margin       int
 }
 
-func NewPacketDispatcher() *PacketDispatcher {
+func NewPacketDispatcher(margin int) *PacketDispatcher {
 	return &PacketDispatcher{
 		connChannels: make(map[uint16]chan []byte),
 		heartbeatCh:  make(chan []byte, 32),
 		connectCh:    make(chan []byte, 32),
+		syncCh:       make(chan []byte, 32),
+		syncCompCh:   make(chan []byte, 32),
+		margin:       margin,
 	}
 }
 
@@ -89,7 +162,17 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 		case pd.connectCh <- data:
 		default:
 		}
-	case typeData, typeConnAck:
+	case typeSync:
+		select {
+		case pd.syncCh <- data:
+		default:
+		}
+	case typeSyncComplete:
+		select {
+		case pd.syncCompCh <- data:
+		default:
+		}
+	case typeData, typeConnAck, typeDisconnect:
 		if len(data) >= 3 {
 			id := uint16(data[1])<<8 | uint16(data[2])
 			pd.mu.RLock()
@@ -103,7 +186,12 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 			} else {
 				// Пакет для неизвестного или уже закрытого соединения
 				if data[0] == typeData {
-					log.Printf("Dispatcher: Data for unknown connID %d (len: %d)", id, len(data))
+					log.Printf("Dispatcher: Data for unknown connID %d (len: %d), sending DISCONNECT back", id, len(data))
+					payload := []byte{typeDisconnect, data[1], data[2]}
+					writeToVCam(Encode(payload, pd.margin), pd.margin)
+					recordSentPacket(typeDisconnect)
+				} else if data[0] == typeDisconnect {
+					log.Printf("Dispatcher: Disconnect for already unknown connID %d", id)
 				}
 			}
 		}
@@ -144,6 +232,7 @@ var (
 )
 
 func recordRecvFrame() {
+	//log.Printf("DEBUG: Frame received at %v", time.Now())
 	recvMu.Lock()
 	defer recvMu.Unlock()
 	recvFrames++
@@ -156,10 +245,16 @@ func getRecvFPS() int {
 	recvMu.Lock()
 	defer recvMu.Unlock()
 	now := time.Now()
+	if recvLastCheck.IsZero() {
+		return 0
+	}
 	dur := now.Sub(recvLastCheck).Seconds()
-	// Обновляем если прошло больше секунды ИЛИ если накопилось хотя бы 5 кадров (ускоряет калибровку)
-	if dur >= 1.0 || (dur > 0.1 && recvFrames >= 5) {
+	// Обновляем если прошло больше секунды ИЛИ если накопилось хотя бы 1 кадр (ускоряет калибровку)
+	if dur >= 1.0 || (dur > 0.05 && recvFrames >= 1) {
 		lastRecvFPS = int(float32(recvFrames) / float32(dur))
+		if lastRecvFPS < 1 && recvFrames > 0 {
+			lastRecvFPS = 1
+		}
 		recvFrames = 0
 		recvLastCheck = now
 	}
@@ -219,9 +314,6 @@ func (s *ScreenVideoConn) Read(p []byte) (n int, err error) {
 
 	// Ограничиваем частоту захвата, чтобы не перегружать CPU
 	delay := s.ReadDelay
-	if delay == 0 {
-		delay = 500 * time.Millisecond // 2 FPS по умолчанию
-	}
 
 	// Точное соблюдение интервала захвата
 	if !s.lastRead.IsZero() {
@@ -257,7 +349,7 @@ func (s *ScreenVideoConn) Write(p []byte) (n int, err error) {
 		Stride: width * 4,
 		Rect:   image.Rect(0, 0, width, height),
 	}
-	writeToVCam(img)
+	writeToVCam(img, s.Margin)
 	return len(p), nil
 }
 
@@ -265,9 +357,41 @@ func (s *ScreenVideoConn) Close() error {
 	return nil
 }
 
-func writeToVCam(img *image.RGBA) {
+var (
+	vcamMu           sync.Mutex
+	vcamLastWrite    time.Time
+	vcamCleared      bool
+	vcamGlobalMargin int
+	vcamIdleOnce     sync.Once
+)
+
+func writeToVCam(img *image.RGBA, margin int) {
+	vcamIdleOnce.Do(func() {
+		go vcamIdleHandler()
+	})
 	if vcam != nil {
+		vcamMu.Lock()
+		defer vcamMu.Unlock()
 		vcam.WriteFrame(img)
+		vcamLastWrite = time.Now()
+		vcamCleared = false
+		vcamGlobalMargin = margin
+	}
+}
+
+func vcamIdleHandler() {
+	for {
+		time.Sleep(100 * time.Millisecond)
+		vcamMu.Lock()
+		if !vcamCleared && !vcamLastWrite.IsZero() && time.Since(vcamLastWrite) > 500*time.Millisecond {
+			if vcam != nil {
+				// Кодируем пустой кадр для очистки экрана
+				img := Encode(nil, vcamGlobalMargin)
+				vcam.WriteFrame(img)
+			}
+			vcamCleared = true
+		}
+		vcamMu.Unlock()
 	}
 }
 
@@ -275,11 +399,21 @@ func writeToVCam(img *image.RGBA) {
 // Также получает пакеты из incoming канала и пишет в dataConn.
 func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, margin int, connID uint16, initialFPS int, incoming chan []byte) {
 	done := make(chan bool, 2)
+	var closeOnce sync.Once
+	sendDisconnect := func() {
+		closeOnce.Do(func() {
+			payload := []byte{typeDisconnect, byte(connID >> 8), byte(connID)}
+			writeToVCam(Encode(payload, margin), margin)
+			recordSentPacket(typeDisconnect)
+		})
+	}
+
 	var bytesSent, bytesReceived int64
 	var lastSentSeq, lastRevSeq byte
 	lastSentSeq = 0
 	lastRevSeq = 0
-	var lastDataAt = time.Now()
+
+	var myHBSeq uint32
 
 	var mySID int64
 	if video != nil {
@@ -303,6 +437,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 
 	lastFPSIncrease := time.Now()
 	lastHeartbeat := time.Now()
+
+	var activityMu sync.Mutex
+	lastActivity := time.Now()
 
 	type speedState struct {
 		mu                sync.Mutex
@@ -338,6 +475,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 
 			if needHB {
 				fpsMetrics, ms := getPerfMetrics()
+				myHBSeq++
 				hb := HeartbeatData{
 					FPS:          fpsMetrics,
 					ProcessingMS: ms,
@@ -346,11 +484,17 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 					ReceivedFPS:  getRecvFPS(),
 					Ready:        true,
 					SessionID:    mySID,
+					Seq:          myHBSeq,
 				}
 				hbBytes, _ := json.Marshal(hb)
 				payload := append([]byte{typeHeartbeat}, hbBytes...)
-				writeToVCam(Encode(payload, margin))
+				writeToVCam(Encode(payload, margin), margin)
+				recordSentPacket(typeHeartbeat)
 				lastHeartbeat = time.Now()
+
+				activityMu.Lock()
+				lastActivity = time.Now()
+				activityMu.Unlock()
 
 				if remRecv >= fps && fpsIdx < len(fpsLevels)-1 && time.Since(lastFPSIncrease) > 5*time.Second {
 					fpsIdx++
@@ -371,7 +515,10 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			n, err := dataConn.Read(buf)
 
 			if err == nil && n > 0 {
-				lastDataAt = time.Now()
+				activityMu.Lock()
+				lastActivity = time.Now()
+				activityMu.Unlock()
+
 				lastSentSeq++
 				if lastSentSeq == 0 {
 					lastSentSeq = 1
@@ -383,13 +530,15 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				payload[3] = lastSentSeq
 				copy(payload[4:], buf[:n])
 				img := Encode(payload, margin)
-				writeToVCam(img)
+				writeToVCam(img, margin)
+				recordSentPacket(typeData)
 				bytesSent += int64(n)
 				// log.Printf("Tunnel: Sent pkt seq=%d, len=%d (total sent: %d)", lastSentSeq, n, bytesSent)
 				time.Sleep(sendInterval / 2)
 			} else if err != nil {
 				if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 					log.Printf("Tunnel: dataConn read error (ID: %d): %v", connID, err)
+					sendDisconnect()
 					return
 				}
 			}
@@ -399,8 +548,13 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				time.Sleep(sendInterval - elapsed)
 			}
 
-			if time.Since(lastDataAt) > 30*time.Second {
+			activityMu.Lock()
+			inactive := time.Since(lastActivity) > 30*time.Second
+			activityMu.Unlock()
+
+			if inactive {
 				log.Printf("Tunnel: Inactive for 30s, closing (ID: %d)", connID)
+				sendDisconnect()
 				return
 			}
 		}
@@ -412,11 +566,16 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			done <- true
 		}()
 		var remoteSID int64
+		var lastRemoteHBSeq uint32
 		for data := range incoming {
 			if len(data) < 1 {
 				continue
 			}
 			switch data[0] {
+			case typeDisconnect:
+				log.Printf("Tunnel: Received DISCONNECT (ID: %d)", connID)
+				closeOnce.Do(func() {}) // Mark as closed without sending back
+				return
 			case typeData:
 				if len(data) < 4 {
 					continue
@@ -427,10 +586,14 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				}
 				seq := data[3]
 				if seq != lastRevSeq {
-					lastDataAt = time.Now()
+					activityMu.Lock()
+					lastActivity = time.Now()
+					activityMu.Unlock()
+
 					n, err := dataConn.Write(data[4:])
 					if err != nil {
 						log.Printf("Tunnel: dataConn write error (ID: %d): %v", connID, err)
+						sendDisconnect()
 						return
 					}
 					bytesReceived += int64(n)
@@ -444,7 +607,11 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 						log.Printf("Tunnel: Remote session ID changed (%d -> %d), closing tunnel", remoteSID, hb.SessionID)
 						return
 					}
+					if hb.Seq != 0 && hb.Seq <= lastRemoteHBSeq && hb.SessionID == remoteSID {
+						continue // Пропускаем дубликаты
+					}
 					remoteSID = hb.SessionID
+					lastRemoteHBSeq = hb.Seq
 					ss.mu.Lock()
 					ss.lastRemoteFPS = hb.TargetFPS
 					ss.remoteReceivedFPS = hb.ReceivedFPS
@@ -458,7 +625,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
-		writeToVCam(Encode(nil, margin))
+		writeToVCam(Encode(nil, margin), margin)
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -482,26 +649,114 @@ func RunScreenSocksServer(x, y, margin int) {
 	activeVideoConn = video
 	activeVideoMu.Unlock()
 
-	pd := NewPacketDispatcher()
+	pd := NewPacketDispatcher(margin)
 	go pd.Run(video, margin)
 
 	var lastHeartbeatRecv time.Time
 	var lastLog time.Time
+	var lastHBSeq uint32
+	var remoteSID int64
+	var syncPhase int // 0: Idle, 1: CalibratingClient, 2: SendingToClient, 3: Done
+	var syncStartTime time.Time
+	var syncCount int
+	var stopServerSync chan struct{}
+
 	for {
 		select {
+		case data := <-pd.syncCh:
+			var sd SyncData
+			if err := json.Unmarshal(data[1:], &sd); err == nil {
+				if remoteSID != 0 && sd.SessionID != remoteSID {
+					log.Printf("Server: Remote session ID changed (%d -> %d), restarting sync", remoteSID, sd.SessionID)
+					remoteSID = sd.SessionID
+					syncPhase = 0
+					if stopServerSync != nil {
+						close(stopServerSync)
+						stopServerSync = nil
+					}
+				}
+
+				if syncPhase == 0 {
+					log.Printf("Server: New sync session detected (SID=%d). Phase 1: Calibrating client for 10s...", sd.SessionID)
+					remoteSID = sd.SessionID
+					syncPhase = 1
+					video.ReadDelay = 0 // Max speed for calibration
+					syncStartTime = time.Now()
+					syncCount = 0
+				}
+
+				if syncPhase == 1 {
+					syncCount++
+					if time.Since(syncStartTime) >= 10*time.Second {
+						dur := time.Since(syncStartTime).Seconds()
+						calculatedFPS := int(float64(syncCount) / dur)
+						if calculatedFPS < 1 {
+							calculatedFPS = 1
+						}
+						if calculatedFPS > 30 {
+							calculatedFPS = 30
+						}
+						log.Printf("Server: Phase 1 done. Client FPS=%d (dur=%.2fs). Transitioning to Phase 2...", calculatedFPS, dur)
+
+						syncPhase = 2
+						stopServerSync = make(chan struct{})
+						// Начинаем отправлять свои синхропакеты
+						go func(sid int64, fps int, stop chan struct{}) {
+							log.Printf("Server: Phase 2: Sending SYNC to client...")
+							for {
+								select {
+								case <-stop:
+									return
+								default:
+									resp := SyncData{SessionID: video.SessionID, Random: generateRandomString(32), MeasuredFPS: fps}
+									respBytes, _ := json.Marshal(resp)
+									img := Encode(append([]byte{typeSync}, respBytes...), margin)
+									writeToVCam(img, margin)
+									recordSentPacket(typeSync)
+									time.Sleep(10 * time.Millisecond) // Max rate 100 FPS
+								}
+							}
+						}(video.SessionID, calculatedFPS, stopServerSync)
+					}
+				}
+			}
+
+		case data := <-pd.syncCompCh:
+			var scd SyncCompleteData
+			if err := json.Unmarshal(data[1:], &scd); err == nil {
+				if scd.SessionID == remoteSID && syncPhase == 2 {
+					log.Printf("Server: Received SYNC_COMPLETE. Final FPS: %d", scd.FPS)
+					if stopServerSync != nil {
+						close(stopServerSync)
+						stopServerSync = nil
+					}
+					video.ReadDelay = time.Second / time.Duration(scd.FPS)
+					syncPhase = 3
+				}
+			}
+
 		case data := <-pd.heartbeatCh:
+			if syncPhase != 3 {
+				continue
+			}
 			var hb HeartbeatData
 			if err := json.Unmarshal(data[1:], &hb); err == nil {
+				if hb.Seq != 0 && hb.Seq <= lastHBSeq && hb.SessionID == remoteSID && hb.Phase == 0 {
+					continue
+				}
+				lastHBSeq = hb.Seq
+
 				if time.Since(lastLog) > 5*time.Second {
-					log.Printf("Server: Remote quality: SID=%d, FPS=%.1f, TargetFPS=%d", hb.SessionID, hb.FPS, hb.TargetFPS)
+					log.Printf("Server: Quality: SID=%d, Phase=%d, RemoteFPS=%.1f, RemoteTarget=%d, Sent:[%s], RecvFPS=%d",
+						hb.SessionID, hb.Phase, hb.FPS, hb.TargetFPS, getSentStatsAndReset(), getRecvFPS())
 					lastLog = time.Now()
 				}
 				lastHeartbeatRecv = time.Now()
 
 				if hb.TargetFPS > 0 {
-					newDelay := time.Second / time.Duration(hb.TargetFPS*2)
-					if newDelay < 20*time.Millisecond {
-						newDelay = 20 * time.Millisecond
+					newDelay := time.Second / time.Duration(hb.TargetFPS)
+					if newDelay < 10*time.Millisecond {
+						newDelay = 10 * time.Millisecond
 					}
 					if video.ReadDelay != newDelay {
 						log.Printf("Server: Adapting capture delay to %v (Target FPS: %d)", newDelay, hb.TargetFPS)
@@ -514,23 +769,51 @@ func RunScreenSocksServer(x, y, margin int) {
 					FPS:          fps,
 					ProcessingMS: ms,
 					Timestamp:    time.Now().Unix(),
-					TargetFPS:    int(1000 / video.ReadDelay.Milliseconds()),
+					TargetFPS:    int(time.Second / video.ReadDelay),
 					ReceivedFPS:  getRecvFPS(),
 					Ready:        true,
 					SessionID:    video.SessionID,
+					Seq:          hb.Seq,
+					Phase:        0,
 				}
 				hbBytes, _ := json.Marshal(resp)
-				writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
+				writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin), margin)
+				recordSentPacket(typeHeartbeat)
 			}
 
 		case data := <-pd.connectCh:
-			if len(data) < 3 {
+			if syncPhase != 3 {
+				continue
+			}
+			if len(data) < 4 { // Тип(1) + ID(2) + Seq(1) + Адрес
 				continue
 			}
 			connID := uint16(data[1])<<8 | uint16(data[2])
-			targetAddr := string(data[3:])
+			seq := data[3]
+			targetAddr := string(data[4:])
 			targetAddr = strings.TrimRight(targetAddr, "\x00")
-			log.Printf("Server: Decoded CONNECT to %s (ID: %d)", targetAddr, connID)
+
+			// Проверка на дубликаты CONNECT
+			activeVideoMu.RLock()
+			pd_local := pd
+			activeVideoMu.RUnlock()
+			pd_local.mu.RLock()
+			_, alreadyActive := pd_local.connChannels[connID]
+			pd_local.mu.RUnlock()
+
+			if alreadyActive {
+				// Просто подтверждаем еще раз, если это повтор
+				payload := make([]byte, 4)
+				payload[0] = typeConnAck
+				payload[1] = byte(connID >> 8)
+				payload[2] = byte(connID)
+				payload[3] = 0 // Success
+				writeToVCam(Encode(payload, margin), margin)
+				recordSentPacket(typeConnAck)
+				continue
+			}
+
+			log.Printf("Server: Decoded CONNECT to %s (ID: %d, seq: %d)", targetAddr, connID, seq)
 
 			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 			status := byte(0)
@@ -544,7 +827,8 @@ func RunScreenSocksServer(x, y, margin int) {
 			payload[1] = byte(connID >> 8)
 			payload[2] = byte(connID)
 			payload[3] = status
-			writeToVCam(Encode(payload, margin))
+			writeToVCam(Encode(payload, margin), margin)
+			recordSentPacket(typeConnAck)
 
 			if err == nil {
 				ch := pd.Register(connID)
@@ -579,105 +863,93 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 	activeVideoConn = video
 	activeVideoMu.Unlock()
 
-	pd := NewPacketDispatcher()
+	pd := NewPacketDispatcher(margin)
 	go pd.Run(video, margin)
 
+	var hbSeq uint32
+
 	for {
-		log.Printf("Client: Starting handshake/calibration phase...")
-		bestFPS := 1
+		log.Printf("Client: Starting synchronization...")
+		var serverSID int64
+		var syncStartTime time.Time
+		var syncCount int
+		var clientSyncPhase int // 0: Initiating, 1: CalibratingServer, 2: Done
+		var stopInitiating chan struct{} = make(chan struct{})
 
-		// 1. Ждем хотя бы минимальной стабильности на 1 FPS
-		for {
-			log.Printf("Client: Testing base FPS level: 1...")
-			video.ReadDelay = 500 * time.Millisecond
-
-			fpsMetrics, ms := getPerfMetrics()
-			hb := HeartbeatData{
-				FPS:          fpsMetrics,
-				ProcessingMS: ms,
-				Timestamp:    time.Now().Unix(),
-				TargetFPS:    1,
-				ReceivedFPS:  getRecvFPS(),
-				Ready:        true,
-				SessionID:    video.SessionID,
-			}
-			hbBytes, _ := json.Marshal(hb)
-			writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
-
-			timer := time.After(2 * time.Second)
-			connected := false
-		CalibrationLoop1:
+		// Phase 0: Отправляем свои синхропакеты на максимально доступной скорости
+		go func(sid int64, stop chan struct{}) {
 			for {
 				select {
-				case data := <-pd.heartbeatCh:
-					var remoteHb HeartbeatData
-					if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
-						connected = true
-						break CalibrationLoop1
-					}
-				case <-timer:
-					break CalibrationLoop1
+				case <-stop:
+					return
+				default:
+					syncPayload, _ := json.Marshal(SyncData{SessionID: sid, Random: generateRandomString(32)})
+					syncPacketImg := Encode(append([]byte{typeSync}, syncPayload...), margin)
+					writeToVCam(syncPacketImg, margin)
+					recordSentPacket(typeSync)
+					time.Sleep(10 * time.Millisecond)
 				}
 			}
+		}(video.SessionID, stopInitiating)
 
-			if connected {
-				log.Printf("Client: Connection established at 1 FPS")
-				break
-			}
-			log.Printf("Client: Server not responding, retrying...")
-			time.Sleep(1 * time.Second)
-		}
+	WaitSync:
+		for {
+			select {
+			case data := <-pd.syncCh:
+				var sd SyncData
+				if err := json.Unmarshal(data[1:], &sd); err == nil {
+					if clientSyncPhase == 0 {
+						log.Printf("Client: Server SYNC detected (SID=%d). Phase 1: Calibrating server for 10s...", sd.SessionID)
+						// Останавливаем свою отправку
+						close(stopInitiating)
+						serverSID = sd.SessionID
+						clientSyncPhase = 1
+						video.ReadDelay = 0 // Max speed for calibration
+						syncStartTime = time.Now()
+						syncCount = 0
+					}
+					if clientSyncPhase == 1 && sd.SessionID == serverSID {
+						syncCount++
+						if time.Since(syncStartTime) >= 10*time.Second {
+							dur := time.Since(syncStartTime).Seconds()
+							calculatedFPS := int(float64(syncCount) / dur)
+							if calculatedFPS < 1 {
+								calculatedFPS = 1
+							}
+							if calculatedFPS > 30 {
+								calculatedFPS = 30
+							}
+							log.Printf("Client: Phase 1 done. Server FPS=%d (dur=%.2fs). Sending SYNC_COMPLETE...", calculatedFPS, dur)
 
-		// 2. Пробуем повысить FPS
-		for _, testFPS := range fpsLevels {
-			if testFPS <= 1 {
-				continue
-			}
-			log.Printf("Client: Testing FPS level: %d...", testFPS)
-			video.ReadDelay = time.Duration(1000/(testFPS*2)) * time.Millisecond
+							// Phase 2: Отправляем SYNC_COMPLETE
+							scd := SyncCompleteData{SessionID: video.SessionID, FPS: calculatedFPS}
+							scdBytes, _ := json.Marshal(scd)
+							for i := 0; i < 5; i++ { // Отправляем несколько раз для надежности
+								writeToVCam(Encode(append([]byte{typeSyncComplete}, scdBytes...), margin), margin)
+								recordSentPacket(typeSyncComplete)
+								time.Sleep(50 * time.Millisecond)
+							}
 
-			success := false
-			fpsMetrics, ms := getPerfMetrics()
-			hb := HeartbeatData{
-				FPS:          fpsMetrics,
-				ProcessingMS: ms,
-				Timestamp:    time.Now().Unix(),
-				TargetFPS:    testFPS,
-				ReceivedFPS:  getRecvFPS(),
-				Ready:        true,
-				SessionID:    video.SessionID,
-			}
-			hbBytes, _ := json.Marshal(hb)
-			writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
-
-			timer := time.After(2 * time.Second)
-		CalibrationLoop2:
-			for {
-				select {
-				case data := <-pd.heartbeatCh:
-					var remoteHb HeartbeatData
-					if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
-						if remoteHb.ReceivedFPS >= testFPS-2 && remoteHb.ReceivedFPS > 0 {
-							success = true
-							break CalibrationLoop2
+							video.ReadDelay = time.Second / time.Duration(calculatedFPS)
+							clientSyncPhase = 2
+							break WaitSync
 						}
 					}
-				case <-timer:
-					break CalibrationLoop2
 				}
-			}
-
-			if success {
-				log.Printf("Client: FPS level %d is stable", testFPS)
-				bestFPS = testFPS
-			} else {
-				log.Printf("Client: FPS level %d failed, staying at %d", testFPS, bestFPS)
-				break
+			case <-time.After(60 * time.Second):
+				log.Printf("Client: Sync timeout, retrying...")
+				if clientSyncPhase == 0 {
+					close(stopInitiating)
+				}
+				break WaitSync
 			}
 		}
 
-		log.Printf("Client: Calibration finished. Best FPS: %d", bestFPS)
-		video.ReadDelay = time.Duration(1000/(bestFPS*2)) * time.Millisecond
+		if clientSyncPhase != 2 {
+			continue
+		}
+
+		bestFPS := int(time.Second / video.ReadDelay)
 
 		ln, err := net.Listen("tcp", localListenAddr)
 		if err != nil {
@@ -694,14 +966,31 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			}
 			ticker := time.NewTicker(hbInterval)
 			defer ticker.Stop()
+			lastClientLog := time.Now()
+			var lastRemoteHBSeq uint32
+
 			for {
 				select {
 				case <-stopSession:
 					return
-				case <-pd.heartbeatCh:
-					// Just consume
+				case data := <-pd.heartbeatCh:
+					var hb HeartbeatData
+					if err := json.Unmarshal(data[1:], &hb); err == nil {
+						if hb.Seq != 0 && hb.Seq <= lastRemoteHBSeq {
+							continue
+						}
+						lastRemoteHBSeq = hb.Seq
+
+						// Периодический лог качества на клиенте
+						if time.Since(lastClientLog) > 5*time.Second {
+							log.Printf("Client: Quality: SID=%d, RemoteFPS=%.1f, RemoteTarget=%d, Sent:[%s], RecvFPS=%d",
+								hb.SessionID, hb.FPS, hb.TargetFPS, getSentStatsAndReset(), getRecvFPS())
+							lastClientLog = time.Now()
+						}
+					}
 				case <-ticker.C:
 					fpsMetrics, ms := getPerfMetrics()
+					hbSeq++
 					hb := HeartbeatData{
 						FPS:          fpsMetrics,
 						ProcessingMS: ms,
@@ -710,9 +999,11 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						ReceivedFPS:  getRecvFPS(),
 						Ready:        true,
 						SessionID:    video.SessionID,
+						Seq:          hbSeq,
 					}
 					hbBytes, _ := json.Marshal(hb)
-					writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
+					writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin), margin)
+					recordSentPacket(typeHeartbeat)
 				}
 			}
 		}()
@@ -733,12 +1024,14 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			connID := uint16(rand.Intn(65535) + 1)
 			log.Printf("Client: New connection to %s (ID: %d)", targetAddr, connID)
 
-			payload := make([]byte, 3+len(targetAddr))
+			payload := make([]byte, 4+len(targetAddr))
 			payload[0] = typeConnect
 			payload[1] = byte(connID >> 8)
 			payload[2] = byte(connID)
-			copy(payload[3:], targetAddr)
-			writeToVCam(Encode(payload, margin))
+			payload[3] = 1 // Initial seq for connect
+			copy(payload[4:], targetAddr)
+			writeToVCam(Encode(payload, margin), margin)
+			recordSentPacket(typeConnect)
 
 			ch := pd.Register(connID)
 			success := false
@@ -752,7 +1045,10 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						break WaitAck
 					}
 				case <-timer:
-					break WaitAck
+					// Повторная отправка CONNECT если нет ответа 2 секунды
+					writeToVCam(Encode(payload, margin), margin)
+					recordSentPacket(typeConnect)
+					timer = time.After(3 * time.Second) // Ждем еще до общего таймаута 5с
 				}
 			}
 

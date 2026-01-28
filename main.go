@@ -299,7 +299,7 @@ func main() {
 		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
 		// Отправим пустой кадр для инициализации MJPEG сервера
-		vcam.WriteFrame(Encode(nil, finalMargin))
+		writeToVCam(Encode(nil, finalMargin), finalMargin)
 		defer cam.Close()
 	}
 
@@ -319,6 +319,7 @@ func main() {
 	// Запускаем фоновый трекинг по маркерам
 	go func() {
 		log.Printf("%s: Starting continuous tracking via control points...", *mode)
+		startTime := time.Now()
 		for {
 			activeVideoMu.RLock()
 			conn := activeVideoConn
@@ -360,7 +361,6 @@ func main() {
 				// 2. Если в локальной области не нашли, сканируем весь экран
 				if !found {
 					sw, sh := GetScreenSize()
-					// log.Printf("%s: Markers lost. Scanning whole screen %dx%d...", *mode, sw, sh)
 					img, err := CaptureScreenEx(0, 0, 0, sw, sh)
 					if err == nil {
 						nx, ny, ok := FindMarkers(img, *mode)
@@ -375,7 +375,13 @@ func main() {
 					}
 				}
 			}
-			time.Sleep(2 * time.Second)
+
+			// В начале сессии ищем чаще
+			if time.Since(startTime) < 10*time.Second {
+				time.Sleep(500 * time.Millisecond)
+			} else {
+				time.Sleep(2 * time.Second)
+			}
 		}
 	}()
 

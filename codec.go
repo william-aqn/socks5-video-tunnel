@@ -150,7 +150,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 	drawMarker(markerOffset, height-markerSize-markerOffset, markers.BL)
 	drawMarker(width-markerSize-markerOffset, height-markerSize-markerOffset, markers.BR)
 
-	// Длина данных (2 байта достаточно для такого метода, макс ~8000 байт при blockSize=4)
+	// Длина данных (2 байта достаточно для такого метода, макс ~2400 байт при blockSize=4)
 	dataLen := len(data)
 	header := []byte{
 		byte(dataLen >> 8),
@@ -160,6 +160,13 @@ func Encode(data []byte, margin int) *image.RGBA {
 	fullData := append(header, data...)
 	checksum := crc8(fullData)
 	fullData = append(fullData, checksum)
+
+	// Padding для стабилизации визуальной сетки (до 256 байт полезной нагрузки)
+	const stableSize = 256
+	if len(data) < stableSize {
+		padding := make([]byte, stableSize-len(data))
+		fullData = append(fullData, padding...)
+	}
 
 	// Превращаем данные в поток бит
 	bits := make([]bool, 0, len(fullData)*8)
