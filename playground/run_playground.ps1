@@ -2,7 +2,7 @@
 # This script builds the project and runs both server and client in a pre-configured way
 # so they can talk to each other through the Debug UI windows.
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 # Get the directory where this script is located
 $ScriptDir = $PSScriptRoot

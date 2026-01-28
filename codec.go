@@ -79,7 +79,6 @@ func FindMarkers(img *image.RGBA, mode string) (int, int, bool) {
 	distY := height - markerSize - 2*markerOffset
 
 	// Сканируем изображение в поисках TL маркера
-	// Используем шаг 2 для надежности при поиске маленького маркера (8x8)
 	for y := 0; y < img.Rect.Dy()-height+markerSize; y += 2 {
 		for x := 0; x < img.Rect.Dx()-width+markerSize; x += 2 {
 			c := img.RGBAAt(x, y)
@@ -144,7 +143,6 @@ func Encode(data []byte, margin int) *image.RGBA {
 	if CurrentMode == "server" {
 		markers = ServerMarkers
 	}
-	// log.Printf("Codec: Encoding %d bytes in %s mode", len(data), CurrentMode)
 
 	drawMarker(markerOffset, markerOffset, markers.TL)
 	drawMarker(width-markerSize-markerOffset, markerOffset, markers.TR)
@@ -210,16 +208,13 @@ func Decode(img *image.RGBA, margin int) []byte {
 	findCenter := func(cr ColorRange, sx, sy, sw, sh int) (float64, float64, bool) {
 		var sumX, sumY float64
 		var count float64
-		// log.Printf("Codec: findCenter searching in x=[%d,%d], y=[%d,%d]", sx, sx+sw, sy, sy+sh)
 		for y := sy; y < sy+sh; y++ {
 			for x := sx; x < sx+sw; x++ {
 				if x < 0 || x >= img.Bounds().Dx() || y < 0 || y >= img.Bounds().Dy() {
 					continue
 				}
 				c := img.RGBAAt(x, y)
-				if int(c.R) >= cr.rMin && int(c.R) <= cr.rMax &&
-					int(c.G) >= cr.gMin && int(c.G) <= cr.gMax &&
-					int(c.B) >= cr.bMin && int(c.B) <= cr.bMax {
+				if matchRange(c.R, c.G, c.B, cr) {
 					sumX += float64(x)
 					sumY += float64(y)
 					count++
@@ -245,21 +240,10 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 	// TR (правый верхний) - ищем в правой половине
 	gx, _, okG := findCenter(ranges.TR, int(rx)+624-50, int(ry)-50, 100, 100)
-	if !okG {
-		// log.Printf("Codec: TR marker not found")
-	}
-
 	// BL (левый нижний) - ищем в нижней половине
 	_, by, okB := findCenter(ranges.BL, int(rx)-50, int(ry)+464-50, 100, 100)
-	if !okB {
-		// log.Printf("Codec: BL marker not found")
-	}
-
 	// BR (правый нижний) - ищем в правой нижней четверти
-	_, _, okW := findCenter(ranges.BR, int(rx)+624-50, int(ry)+464-50, 100, 100)
-	if !okW {
-		// log.Printf("Codec: BR marker not found")
-	}
+	findCenter(ranges.BR, int(rx)+624-50, int(ry)+464-50, 100, 100)
 
 	scaleX := 1.0
 	scaleY := 1.0
@@ -272,10 +256,6 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 	offsetX := rx - 8.0*scaleX // markerOffset + markerSize/2
 	offsetY := ry - 8.0*scaleY
-
-	if okG && okB && okW {
-		// log.Printf("Codec: Calibration: ScaleX=%.3f, ScaleY=%.3f, Offset=(%.1f, %.1f)", scaleX, scaleY, offsetX, offsetY)
-	}
 
 	var bits []bool
 	for y := margin; y <= height-margin-blockSize; y += blockSize {
@@ -341,10 +321,8 @@ func Decode(img *image.RGBA, margin int) []byte {
 	expectedCRC := fullData[2+dataLen]
 	actualCRC := crc8(fullData[:2+dataLen])
 	if expectedCRC != actualCRC {
-		// log.Printf("Codec: CRC mismatch! Len=%d, Expected %02x, got %02x", dataLen, expectedCRC, actualCRC)
 		return nil
 	}
 
-	// log.Printf("Codec: Successfully decoded %d bytes: %02x", dataLen, fullData[2:2+dataLen])
 	return fullData[2 : 2+dataLen]
 }
