@@ -37,25 +37,25 @@ var (
 		BR: color.RGBA{255, 255, 255, 255}, // White
 	}
 	ServerMarkers = MarkerColors{
-		TL: color.RGBA{255, 255, 0, 255}, // Yellow
+		TL: color.RGBA{0, 255, 255, 255}, // Cyan
 		TR: color.RGBA{255, 0, 255, 255}, // Magenta
-		BL: color.RGBA{0, 255, 255, 255}, // Cyan
+		BL: color.RGBA{255, 255, 0, 255}, // Yellow
 		BR: color.RGBA{255, 165, 0, 255}, // Orange
 	}
 )
 
 var (
 	ClientRanges = MarkerRanges{
-		TL: ColorRange{200, 255, 0, 100, 0, 100},     // Red
-		TR: ColorRange{0, 100, 200, 255, 0, 100},     // Green
-		BL: ColorRange{0, 100, 0, 100, 200, 255},     // Blue
-		BR: ColorRange{200, 255, 200, 255, 200, 255}, // White
+		TL: ColorRange{160, 255, 0, 120, 0, 120},     // Red
+		TR: ColorRange{0, 120, 160, 255, 0, 120},     // Green
+		BL: ColorRange{0, 120, 0, 120, 160, 255},     // Blue
+		BR: ColorRange{160, 255, 160, 255, 160, 255}, // White
 	}
 	ServerRanges = MarkerRanges{
-		TL: ColorRange{200, 255, 200, 255, 0, 100}, // Yellow
-		TR: ColorRange{200, 255, 0, 100, 200, 255}, // Magenta
-		BL: ColorRange{0, 100, 200, 255, 200, 255}, // Cyan
-		BR: ColorRange{200, 255, 120, 210, 0, 100}, // Orange
+		TL: ColorRange{0, 120, 160, 255, 160, 255}, // Cyan
+		TR: ColorRange{160, 255, 0, 120, 160, 255}, // Magenta
+		BL: ColorRange{160, 255, 160, 255, 0, 120}, // Yellow
+		BR: ColorRange{160, 255, 120, 220, 0, 120}, // Orange
 	}
 )
 
@@ -131,6 +131,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 	if CurrentMode == "server" {
 		markers = ServerMarkers
 	}
+	log.Printf("Codec: Encoding %d bytes in %s mode (TL Color: %+v)", len(data), CurrentMode, markers.TL)
 
 	drawMarker(markerOffset, markerOffset, markers.TL)
 	drawMarker(width-markerSize-markerOffset, markerOffset, markers.TR)
@@ -223,7 +224,6 @@ func Decode(img *image.RGBA, margin int) []byte {
 	// TL (левый верхний)
 	rx, ry, okR := findCenter(ranges.TL, 0, 0, 150, 150)
 	if !okR {
-		// log.Printf("Codec: TL marker not found")
 		return nil
 	}
 

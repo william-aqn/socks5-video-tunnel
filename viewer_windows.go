@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -45,9 +46,52 @@ type ViewerState struct {
 	currentBody io.Closer
 	gdiBuf      []byte
 	gdiW, gdiH  int32
+	frameCount  int
+	lastCapture time.Time
 }
 
 var viewer ViewerState
+
+func UpdateCaptureStatus(success bool) {
+	if success {
+		viewer.mu.Lock()
+		viewer.lastCapture = time.Now()
+		viewer.mu.Unlock()
+	}
+}
+
+func runStatusUpdateLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	for range ticker.C {
+		viewer.mu.RLock()
+		hwndStatus := viewer.hwndStatus
+		frameCount := viewer.frameCount
+		lastCapture := viewer.lastCapture
+		viewer.mu.RUnlock()
+
+		if hwndStatus == 0 {
+			continue
+		}
+
+		target := "Remote"
+		if CurrentMode == "server" {
+			target = "Client"
+		} else if CurrentMode == "client" {
+			target = "Server"
+		}
+
+		captureStatus := "SEARCHING"
+		if !lastCapture.IsZero() && time.Since(lastCapture) < 5*time.Second {
+			captureStatus = "OK"
+		}
+
+		status := fmt.Sprintf("Live: %s | Frames: %d | Capture %s: %s",
+			time.Now().Format("15:04:05"), frameCount, target, captureStatus)
+
+		statusPtr, _ := syscall.UTF16PtrFromString(status)
+		procSetWindowTextW.Call(uintptr(hwndStatus), uintptr(unsafe.Pointer(statusPtr)))
+	}
+}
 
 func viewerWndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
@@ -113,6 +157,7 @@ func viewerWndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uint
 }
 
 func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(string)) {
+	log.Printf("StartDebugUI: Starting for mode %s with URL %s", mode, initialURL)
 	runtime.LockOSThread()
 	viewer.url = initialURL
 	viewer.onURLChange = onURLChange
@@ -195,6 +240,10 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 	)
 	viewer.hwndStatus = syscall.Handle(hwndStatus)
 
+	procShowWindow.Call(uintptr(viewer.hwnd), 1) // SW_SHOWNORMAL
+	procUpdateWindow.Call(uintptr(viewer.hwnd))
+
+	go runStatusUpdateLoop()
 	go runMJPEGClient()
 
 	var msg MSG
@@ -209,9 +258,8 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 }
 
 func runMJPEGClient() {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+	log.Printf("Viewer: MJPEG client goroutine started")
+	client := &http.Client{} // Нет таймаута для бесконечного потока
 	for {
 		viewer.mu.RLock()
 		url := viewer.url
@@ -222,13 +270,14 @@ func runMJPEGClient() {
 			continue
 		}
 
+		log.Printf("Viewer: Attempting to connect to %s", url)
 		resp, err := client.Get(url)
 		if err != nil {
-			fmt.Printf("Viewer: Connect error to %s: %v\n", url, err)
+			log.Printf("Viewer: Connect error to %s: %v", url, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		fmt.Printf("Viewer: Connected to %s\n", url)
+		log.Printf("Viewer: Connected to %s", url)
 
 		viewer.mu.Lock()
 		viewer.currentBody = resp.Body
@@ -248,22 +297,24 @@ func runMJPEGClient() {
 		}
 
 		mr := multipart.NewReader(resp.Body, boundary)
-		frameCount := 0
 		for {
 			part, err := mr.NextPart()
 			if err != nil {
+				log.Printf("Viewer: NextPart error: %v", err)
 				break
 			}
 			img, err := jpeg.Decode(part)
 			if err != nil {
+				log.Printf("Viewer: JPEG decode error: %v", err)
 				continue
 			}
 
-			frameCount++
-			if frameCount%10 == 0 {
-				statusText, _ := syscall.UTF16PtrFromString(fmt.Sprintf("Live: %s | Frames: %d", time.Now().Format("15:04:05"), frameCount))
-				procSetWindowTextW.Call(uintptr(viewer.hwndStatus), uintptr(unsafe.Pointer(statusText)))
+			viewer.mu.Lock()
+			viewer.frameCount++
+			if viewer.frameCount%100 == 0 {
+				log.Printf("Viewer: Processed %d frames from MJPEG stream", viewer.frameCount)
 			}
+			viewer.mu.Unlock()
 
 			rgba, ok := img.(*image.RGBA)
 			if !ok {

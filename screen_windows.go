@@ -26,6 +26,8 @@ var (
 	procSelectObject           = modgdi32.NewProc("SelectObject")
 	procBitBlt                 = modgdi32.NewProc("BitBlt")
 	procGetDIBits              = modgdi32.NewProc("GetDIBits")
+	procPrintWindow            = moduser32.NewProc("PrintWindow")
+	procGetSystemMetrics       = moduser32.NewProc("GetSystemMetrics")
 )
 
 const (
@@ -53,20 +55,45 @@ type BITMAPINFO struct {
 	Colors [3]uint32 // Not used for 32-bit
 }
 
+func GetScreenSize() (int, int) {
+	w, _, _ := procGetSystemMetrics.Call(0) // SM_CXSCREEN
+	h, _, _ := procGetSystemMetrics.Call(1) // SM_CYSCREEN
+	return int(w), int(h)
+}
+
 func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
-	hdcScreen, _, _ := procGetDC.Call(0)
-	if hdcScreen == 0 {
+	return CaptureScreenEx(0, x, y, w, h)
+}
+
+func CaptureScreenEx(hwnd syscall.Handle, x, y, w, h int) (*image.RGBA, error) {
+	var hdcSrc uintptr
+	if hwnd != 0 {
+		var rect RECT
+		procGetClientRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
+		// log.Printf("CaptureScreenEx: HWND %v ClientRect: %+v", hwnd, rect)
+
+		res, _, _ := procGetDC.Call(uintptr(hwnd))
+		hdcSrc = res
+		defer procReleaseDC.Call(uintptr(hwnd), hdcSrc)
+		x = 0
+		y = 25
+	} else {
+		res, _, _ := procGetDC.Call(0)
+		hdcSrc = res
+		defer procReleaseDC.Call(0, hdcSrc)
+	}
+
+	if hdcSrc == 0 {
 		return nil, fmt.Errorf("GetDC failed")
 	}
-	defer procReleaseDC.Call(0, hdcScreen)
 
-	hdcMem, _, _ := procCreateCompatibleDC.Call(hdcScreen)
+	hdcMem, _, _ := procCreateCompatibleDC.Call(hdcSrc)
 	if hdcMem == 0 {
 		return nil, fmt.Errorf("CreateCompatibleDC failed")
 	}
 	defer procDeleteDC.Call(hdcMem)
 
-	hBitmap, _, _ := procCreateCompatibleBitmap.Call(hdcScreen, uintptr(w), uintptr(h))
+	hBitmap, _, _ := procCreateCompatibleBitmap.Call(hdcSrc, uintptr(w), uintptr(h))
 	if hBitmap == 0 {
 		return nil, fmt.Errorf("CreateCompatibleBitmap failed")
 	}
@@ -78,7 +105,7 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 	}
 	defer procSelectObject.Call(hdcMem, oldObj)
 
-	ret, _, _ := procBitBlt.Call(hdcMem, 0, 0, uintptr(w), uintptr(h), hdcScreen, uintptr(x), uintptr(y), SRCCOPY)
+	ret, _, _ := procBitBlt.Call(hdcMem, 0, 0, uintptr(w), uintptr(h), hdcSrc, uintptr(x), uintptr(y), SRCCOPY)
 	if ret == 0 {
 		return nil, fmt.Errorf("BitBlt failed")
 	}
@@ -107,15 +134,14 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 		return nil, fmt.Errorf("GetDIBits failed")
 	}
 
-	// Установим Alpha в 255, так как GDI её часто зануляет, а image.RGBA её учитывает
+	// Установим Alpha в 255
 	for i := 3; i < len(img.Pix); i += 4 {
 		img.Pix[i] = 255
 	}
 
-	// Проверим, не пустой ли кадр (хотя бы примерно)
+	// Проверим на пустоту
 	hasData := false
 	for i := 0; i < len(img.Pix); i += 4 {
-		// Игнорируем Alpha при проверке на пустоту
 		if img.Pix[i] != 0 || img.Pix[i+1] != 0 || img.Pix[i+2] != 0 {
 			hasData = true
 			break
@@ -124,12 +150,11 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 	if !hasData {
 		staticEmptyFrames++
 		if staticEmptyFrames%1000 == 0 {
-			log.Printf("CaptureScreen: Captured 1000 empty (black) frames from (%d, %d)", x, y)
+			log.Printf("CaptureScreenEx: Captured 1000 empty (black) frames (HWND: %v, x: %d, y: %d)", hwnd, x, y)
 		}
 	}
 
-	// GetDIBits returns BGRA, image.RGBA expects RGBA
-	// We need to swap B and R channels
+	// Swap BGRA to RGBA
 	for i := 0; i < len(img.Pix); i += 4 {
 		img.Pix[i], img.Pix[i+2] = img.Pix[i+2], img.Pix[i]
 	}

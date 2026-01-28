@@ -240,7 +240,7 @@ func main() {
 				return
 			}
 			fmt.Printf("New area selected: (%d, %d)\n", x, y)
-			UpdateActiveCaptureArea(x, y)
+			UpdateActiveCaptureArea(0, x, y)
 
 			currentCfg.CaptureX = x
 			currentCfg.CaptureY = y
@@ -263,7 +263,7 @@ func main() {
 			if newX != currentCfg.CaptureX || newY != currentCfg.CaptureY {
 				currentCfg.CaptureX = newX
 				currentCfg.CaptureY = newY
-				UpdateActiveCaptureArea(newX, newY)
+				UpdateActiveCaptureArea(0, newX, newY)
 				saveConfig(cfgFile, currentCfg)
 			}
 		}
@@ -281,7 +281,7 @@ func main() {
 		defer cam.Close()
 	}
 
-	ShowCaptureOverlay(*mode, finalX, finalY)
+	// ShowCaptureOverlay(*mode, finalX, finalY)
 
 	if *debugUI {
 		localURL := ""
@@ -294,56 +294,68 @@ func main() {
 		})
 	}
 
-	targetPrefix := ""
-	if *mode == "server" {
-		targetPrefix = "[VGO-CLIENT]"
-	} else if *mode == "client" {
-		targetPrefix = "[VGO-SERVER]"
-	}
+	// Запускаем фоновый трекинг по маркерам
+	go func() {
+		log.Printf("%s: Starting continuous tracking via control points...", *mode)
+		for {
+			activeVideoMu.RLock()
+			conn := activeVideoConn
+			activeVideoMu.RUnlock()
 
-	if targetPrefix != "" {
-		go func() {
-			log.Printf("%s: Starting continuous tracking for '%s'...", *mode, targetPrefix)
-			for {
-				// 1. Сначала пробуем найти окно по заголовку
-				x, y, err := FindCaptureWindow(targetPrefix)
+			if conn != nil {
+				found := false
+				// 1. Сначала пробуем найти маркеры в текущей области (с запасом 200px)
+				searchMargin := 200
+				localX := conn.X - searchMargin/2
+				localY := conn.Y - searchMargin/2
+				if localX < 0 {
+					localX = 0
+				}
+				if localY < 0 {
+					localY = 0
+				}
+				localW := width + searchMargin
+				localH := height + searchMargin
+
+				img, err := CaptureScreenEx(0, localX, localY, localW, localH)
 				if err == nil {
-					if x != currentCfg.CaptureX || y != currentCfg.CaptureY {
-						log.Printf("%s: Window found/moved to (%d, %d), updating...", *mode, x, y)
-						currentCfg.CaptureX = x
-						currentCfg.CaptureY = y
-						UpdateActiveCaptureArea(x, y)
-						saveConfig(cfgFile, currentCfg)
+					dx, dy, ok := FindMarkers(img, *mode)
+					if ok {
+						newX := localX + dx
+						newY := localY + dy
+						if newX != currentCfg.CaptureX || newY != currentCfg.CaptureY {
+							log.Printf("%s: Markers tracked at (%d, %d)", *mode, newX, newY)
+							currentCfg.CaptureX = newX
+							currentCfg.CaptureY = newY
+							UpdateActiveCaptureArea(0, newX, newY)
+							saveConfig(cfgFile, currentCfg)
+						}
+						UpdateCaptureStatus(true)
+						found = true
 					}
-				} else {
-					// 2. Если окно не найдено, пробуем найти маркеры в текущей области
-					activeVideoMu.RLock()
-					conn := activeVideoConn
-					activeVideoMu.RUnlock()
+				}
 
-					if conn != nil {
-						// Захватываем чуть больше (1024x1024), чтобы найти маркеры, даже если они уехали
-						img, err := CaptureScreen(conn.X, conn.Y, captureWidth, captureHeight)
-						if err == nil {
-							dx, dy, found := FindMarkers(img, *mode)
-							if found && (dx != 0 || dy != 0) {
-								newX := conn.X + dx
-								newY := conn.Y + dy
-								if newX != currentCfg.CaptureX || newY != currentCfg.CaptureY {
-									log.Printf("%s: Markers detected at shift (%d, %d). Adjusting to (%d, %d)", *mode, dx, dy, newX, newY)
-									currentCfg.CaptureX = newX
-									currentCfg.CaptureY = newY
-									UpdateActiveCaptureArea(newX, newY)
-									saveConfig(cfgFile, currentCfg)
-								}
-							}
+				// 2. Если в локальной области не нашли, сканируем весь экран
+				if !found {
+					sw, sh := GetScreenSize()
+					// log.Printf("%s: Markers lost. Scanning whole screen %dx%d...", *mode, sw, sh)
+					img, err := CaptureScreenEx(0, 0, 0, sw, sh)
+					if err == nil {
+						nx, ny, ok := FindMarkers(img, *mode)
+						if ok {
+							log.Printf("%s: Markers found on screen at (%d, %d)", *mode, nx, ny)
+							currentCfg.CaptureX = nx
+							currentCfg.CaptureY = ny
+							UpdateActiveCaptureArea(0, nx, ny)
+							saveConfig(cfgFile, currentCfg)
+							UpdateCaptureStatus(true)
 						}
 					}
 				}
-				time.Sleep(2 * time.Second)
 			}
-		}()
-	}
+			time.Sleep(2 * time.Second)
+		}
+	}()
 
 	switch *mode {
 	case "server":

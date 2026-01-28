@@ -10,6 +10,19 @@ if (-not $ScriptDir) { $ScriptDir = Get-Location }
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $ExePath = Join-Path $ScriptDir "video-go.exe"
 
+Write-Host "--- Stopping previous instances ---"
+Stop-Process -Name "video-go" -ErrorAction SilentlyContinue
+
+Write-Host "--- Cleaning up old logs ---"
+$LogFiles = @("server_vgo.log", "client_vgo.log", "debug_server_capture.png")
+foreach ($file in $LogFiles) {
+    $path = Join-Path $ScriptDir $file
+    if (Test-Path $path) {
+        Remove-Item $path
+        Write-Host "Removed $file"
+    }
+}
+
 Write-Host "--- Building Video-Go ---"
 # Build from project root and output to playground directory
 Push-Location $ProjectRoot
@@ -22,10 +35,10 @@ $ClientMJPEGPort = 9001
 $SOCKS5Port = 1080
 
 # Window Positions
-$ServerDebugX = 100
-$ServerDebugY = 100
-$ClientDebugX = 1000
-$ClientDebugY = 100
+$ServerDebugX = 0
+$ServerDebugY = 0
+$ClientDebugX = 700
+$ClientDebugY = 0
 
 # Offsets for capturing video from the Debug UI window
 # Window frames are ~8px, title bar ~31px, and the video itself is offset by 25px in the client area.

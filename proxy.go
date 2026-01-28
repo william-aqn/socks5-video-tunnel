@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +26,7 @@ var (
 
 // ScreenVideoConn реализует io.ReadWriter для работы через захват экрана и VCam
 type ScreenVideoConn struct {
+	HWND   syscall.Handle
 	X, Y   int
 	Margin int
 }
@@ -39,11 +41,11 @@ func (s *ScreenVideoConn) Read(p []byte) (n int, err error) {
 	time.Sleep(30 * time.Millisecond)
 
 	activeVideoMu.RLock()
-	curX, curY := s.X, s.Y
+	curX, curY, hwnd := s.X, s.Y, s.HWND
 	activeVideoMu.RUnlock()
 
 	// Захватываем чуть больше, чтобы компенсировать смещения рамок и DPI
-	img, err := CaptureScreen(curX, curY, captureWidth, captureHeight)
+	img, err := CaptureScreenEx(hwnd, curX, curY, captureWidth, captureHeight)
 	if err != nil {
 		log.Printf("ScreenVideoConn: CaptureScreen error: %v", err)
 		return 0, err
@@ -83,19 +85,21 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	done := make(chan bool, 2)
 	start := time.Now()
 	var bytesSent, bytesReceived int64
+	var lastSentSeq, lastRevSeq byte
 
 	go func() {
 		defer func() { done <- true }()
 		for {
 			// С новым кодеком (blockSize=8) у нас около 500 байт на кадр.
-			maxData := 500
+			maxData := 490
 			buf := make([]byte, maxData)
 			n, err := dataConn.Read(buf)
 			if err != nil {
 				return
 			}
 
-			payload := append([]byte{typeData}, buf[:n]...)
+			lastSentSeq++
+			payload := append([]byte{typeData, lastSentSeq}, buf[:n]...)
 			img := Encode(payload, margin)
 			writeToVCam(img)
 			if _, err := videoConn.Write(img.Pix); err != nil {
@@ -119,14 +123,19 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 
 			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 			data := Decode(img, margin)
-			if len(data) > 0 && data[0] == typeData {
-				n, err := dataConn.Write(data[1:])
-				if err != nil {
-					return
-				}
-				bytesReceived += int64(n)
-				if bytesReceived%1000 < int64(n) {
-					log.Printf("Tunnel: Received %d bytes so far", bytesReceived)
+			if len(data) >= 2 && data[0] == typeData {
+				UpdateCaptureStatus(true)
+				seq := data[1]
+				if seq != lastRevSeq {
+					n, err := dataConn.Write(data[2:])
+					if err != nil {
+						return
+					}
+					bytesReceived += int64(n)
+					lastRevSeq = seq
+					if bytesReceived%1000 < int64(n) {
+						log.Printf("Tunnel: Received %d bytes so far", bytesReceived)
+					}
 				}
 			}
 		}
@@ -137,14 +146,14 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	log.Printf("Tunnel: Closed. Duration: %v, Sent: %d bytes, Received: %d bytes", duration, bytesSent, bytesReceived)
 }
 
-func UpdateActiveCaptureArea(x, y int) {
+func UpdateActiveCaptureArea(hwnd syscall.Handle, x, y int) {
 	activeVideoMu.Lock()
 	defer activeVideoMu.Unlock()
 	if activeVideoConn != nil {
+		activeVideoConn.HWND = hwnd
 		activeVideoConn.X = x
 		activeVideoConn.Y = y
 	}
-	UpdateCaptureOverlay(x, y)
 }
 
 // RunScreenSocksServer работает через захват экрана и VCam с динамическим выбором цели
@@ -185,6 +194,7 @@ func RunScreenSocksServer(x, y, margin int) {
 
 		data := Decode(img, margin)
 		if data != nil {
+			UpdateCaptureStatus(true)
 			log.Printf("Server: Decoded %d bytes from screen", len(data))
 		}
 		if len(data) > 0 && data[0] == typeConnect {
@@ -262,6 +272,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 			ackData := Decode(img, margin)
 			if len(ackData) >= 2 && ackData[0] == typeConnAck {
+				UpdateCaptureStatus(true)
 				if ackData[1] == 0 {
 					success = true
 				}

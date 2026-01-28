@@ -6,8 +6,6 @@ package main
 import (
 	"fmt"
 	"image/color"
-	"log"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -158,56 +156,6 @@ func SelectCaptureArea() (int, int, error) {
 	overlayMu.Unlock()
 
 	return finalX, finalY, nil
-}
-
-func FindCaptureWindow(titlePrefix string) (int, int, error) {
-	var foundX, foundY int
-	var found bool
-
-	callback := syscall.NewCallback(func(hwnd syscall.Handle, lparam uintptr) uintptr {
-		visible, _, _ := procIsWindowVisible.Call(uintptr(hwnd))
-		if visible != 0 {
-			var buf [256]uint16
-			procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), 256)
-			title := syscall.UTF16ToString(buf[:])
-
-			if title != "" && strings.HasPrefix(title, titlePrefix) {
-				// Проверяем класс окна, чтобы не захватить лишнего
-				var classBuf [256]uint16
-				procGetClassNameW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&classBuf[0])), 256)
-				className := syscall.UTF16ToString(classBuf[:])
-
-				if className == "VideoGoViewerClass" {
-					log.Printf("FindCaptureWindow: Found target window '%s' (Class: %s, HWND: %v)", title, className, hwnd)
-
-					var rect RECT
-					procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
-					// Окно VideoGo Debug Viewer имеет заголовок и рамки.
-					// Нам нужны координаты клиентской области, где отрисовывается видео.
-					// Используем AdjustWindowRectEx для определения размеров рамок.
-					adjRect := RECT{0, 0, 100, 100}
-					procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&adjRect)), WS_OVERLAPPEDWINDOW, 0, WS_EX_TOPMOST)
-
-					borderLeft := -adjRect.Left
-					borderTop := -adjRect.Top
-
-					foundX = int(rect.Left) + int(borderLeft)
-					foundY = int(rect.Top) + int(borderTop) + 25 // 31 для заголовка, 25 для URL
-					found = true
-					return 0 // Остановить перечисление
-				}
-			}
-		}
-		return 1
-	})
-
-	procEnumWindows.Call(callback, 0)
-
-	if !found {
-		return 0, 0, fmt.Errorf("window not found with prefix: %s", titlePrefix)
-	}
-
-	return foundX, foundY, nil
 }
 
 var (
