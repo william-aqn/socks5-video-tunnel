@@ -44,7 +44,7 @@ func loadConfig(filename string) (*Config, error) {
 		DebugX:            200,
 		DebugY:            200,
 		HeartbeatInterval: 30,
-		BlockSize:         4,
+		BlockSize:         6,
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
@@ -190,7 +190,7 @@ func main() {
 		if loadedCfg != nil && loadedCfg.BlockSize > 0 {
 			finalBlockSize = loadedCfg.BlockSize
 		} else {
-			finalBlockSize = 4
+			finalBlockSize = 6
 		}
 	}
 	blockSize = finalBlockSize
