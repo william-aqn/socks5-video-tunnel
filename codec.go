@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 )
@@ -98,10 +100,10 @@ func GetMaxPayloadSize(margin int) int {
 	}
 	totalBytes := totalBits / 8
 	// Мы используем x2 избыточность: [Block1][Block2]
-	// Block = [Ver(1)][Len(2)][Data(N)][CRC(2)]
-	// Total bytes = 2 * (5 + N)
-	// N = (Total bytes / 2) - 5
-	maxPayload := (totalBytes / 2) - 5
+	// Block = [Ver(1)][Len(2)][Data(N)][CRC(4)]
+	// Total bytes = 2 * (7 + N)
+	// N = (Total bytes / 2) - 7
+	maxPayload := (totalBytes / 2) - 7
 	if maxPayload < 0 {
 		return 0
 	}
@@ -309,21 +311,6 @@ func rsDecode(data []byte, nsym int) ([]byte, bool) {
 // я буду использовать расширенный CRC и дублирование данных с перемешиванием,
 // что даст аналогичный эффект "избыточности" при сохранении простоты.
 
-func crc16(data []byte) uint16 {
-	var crc uint16 = 0xFFFF
-	for _, b := range data {
-		crc ^= uint16(b) << 8
-		for i := 0; i < 8; i++ {
-			if (crc & 0x8000) != 0 {
-				crc = (crc << 1) ^ 0x1021
-			} else {
-				crc <<= 1
-			}
-		}
-	}
-	return crc
-}
-
 func crc8(data []byte) byte {
 	var crc byte
 	for _, b := range data {
@@ -400,15 +387,15 @@ func Encode(data []byte, margin int) *image.RGBA {
 
 	// Подготовка данных с избыточностью
 	dataLen := len(data)
-	// Блок: [Версия 0x02][Длина 2][Данные][CRC16 2]
+	// Блок: [Версия 0x03][Длина 2][Данные][CRC32 4]
 	header := []byte{
-		0x02,
+		0x03,
 		byte(dataLen >> 8),
 		byte(dataLen),
 	}
 	block := append(header, data...)
-	c16 := crc16(block)
-	block = append(block, byte(c16>>8), byte(c16))
+	c32 := crc32.ChecksumIEEE(block)
+	block = append(block, byte(c32>>24), byte(c32>>16), byte(c32>>8), byte(c32))
 
 	// Создаем две копии блока для избыточности
 	fullData := append(block, block...)
@@ -578,23 +565,23 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 	// Пробуем найти валидный блок в данных (у нас их 2)
 	tryBlock := func(d []byte) []byte {
-		if len(d) < 5 {
+		if len(d) < 7 {
 			return nil
 		}
-		if d[0] != 0x02 && d[0] != 0x01 {
+		if d[0] != 0x03 {
 			return nil
 		}
 		dataLen := int(d[1])<<8 | int(d[2])
 		if dataLen < 0 || dataLen > 8000 {
 			return nil
 		}
-		if dataLen+5 > len(d) {
+		if dataLen+7 > len(d) {
 			return nil
 		}
 
-		expectedC16 := uint16(d[3+dataLen])<<8 | uint16(d[4+dataLen])
-		actualC16 := crc16(d[:3+dataLen])
-		if expectedC16 == actualC16 {
+		expectedC32 := binary.BigEndian.Uint32(d[3+dataLen : 7+dataLen])
+		actualC32 := crc32.ChecksumIEEE(d[:3+dataLen])
+		if expectedC32 == actualC32 {
 			return d[3 : 3+dataLen]
 		}
 		return nil
@@ -607,8 +594,8 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 
 	// Вторая копия (ищем где она начинается)
-	for offset := 1; offset < len(fullData)-5; offset++ {
-		if fullData[offset] == 0x01 || fullData[offset] == 0x02 {
+	for offset := 1; offset < len(fullData)-7; offset++ {
+		if fullData[offset] == 0x03 {
 			res = tryBlock(fullData[offset:])
 			if res != nil {
 				return res
