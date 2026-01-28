@@ -75,7 +75,7 @@ var (
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 2048)
+		return make([]byte, 4096)
 	},
 }
 
@@ -572,7 +572,13 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				}
 			}
 
-			maxData := 450
+			maxData := GetMaxPayloadSize(margin) - 4
+			if maxData > 4000 {
+				maxData = 4000
+			}
+			if maxData < 10 {
+				maxData = 10
+			}
 			buf := getBuffer()
 			if tc, ok := dataConn.(interface{ SetReadDeadline(time.Time) error }); ok {
 				tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))

@@ -80,6 +80,34 @@ func matchRange(r, g, b uint8, cr ColorRange) bool {
 		int(b) >= cr.bMin && int(b) <= cr.bMax
 }
 
+// GetMaxPayloadSize возвращает максимальное количество байт, которое можно закодировать в одном кадре.
+func GetMaxPayloadSize(margin int) int {
+	totalBits := 0
+	for y := margin; y <= height-margin-blockSize; y += blockSize {
+		for x := margin; x <= width-margin-blockSize; x += blockSize {
+			// Пропускаем контрольные точки (зона 16x16 для стабильности поиска)
+			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
+				continue
+			}
+			// Пропускаем Timing Patterns (они на краях x=1, y=1)
+			if x < 6 || y < 6 {
+				continue
+			}
+			totalBits += bitsPerBlock
+		}
+	}
+	totalBytes := totalBits / 8
+	// Мы используем x2 избыточность: [Block1][Block2]
+	// Block = [Ver(1)][Len(2)][Data(N)][CRC(2)]
+	// Total bytes = 2 * (5 + N)
+	// N = (Total bytes / 2) - 5
+	maxPayload := (totalBytes / 2) - 5
+	if maxPayload < 0 {
+		return 0
+	}
+	return maxPayload
+}
+
 // FindMarkers ищет контрольные точки в изображении и возвращает координаты левого верхнего угла области захвата
 func FindMarkers(img *image.RGBA, mode string) (int, int, bool) {
 	var ranges MarkerRanges
@@ -557,7 +585,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 			return nil
 		}
 		dataLen := int(d[1])<<8 | int(d[2])
-		if dataLen < 0 || dataLen > 4000 {
+		if dataLen < 0 || dataLen > 8000 {
 			return nil
 		}
 		if dataLen+5 > len(d) {
@@ -580,7 +608,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 	// Вторая копия (ищем где она начинается)
 	for offset := 1; offset < len(fullData)-5; offset++ {
-		if fullData[offset] == 0x01 {
+		if fullData[offset] == 0x01 || fullData[offset] == 0x02 {
 			res = tryBlock(fullData[offset:])
 			if res != nil {
 				return res
