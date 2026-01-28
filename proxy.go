@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/png"
@@ -166,6 +167,7 @@ func RunScreenSocksServer(x, y, margin int) {
 	activeVideoMu.Unlock()
 
 	frameCount := 0
+	var lastData []byte
 	for {
 		frameSize := captureWidth * captureHeight * 4
 		buf := make([]byte, frameSize)
@@ -195,28 +197,33 @@ func RunScreenSocksServer(x, y, margin int) {
 		data := Decode(img, margin)
 		if data != nil {
 			UpdateCaptureStatus(true)
-			log.Printf("Server: Decoded %d bytes from screen", len(data))
-		}
-		if len(data) > 0 && data[0] == typeConnect {
-			targetAddr := string(data[1:])
-			log.Printf("Server: Request to %s", targetAddr)
+			if !bytes.Equal(data, lastData) {
+				log.Printf("Server: Decoded %d bytes from screen", len(data))
+				lastData = data
 
-			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
-			status := byte(0)
-			if err != nil {
-				log.Printf("Server: dial failed to %s: %v", targetAddr, err)
-				status = 1
-			}
+				if len(data) > 0 && data[0] == typeConnect {
+					targetAddr := string(data[1:])
+					log.Printf("Server: Request to %s", targetAddr)
 
-			// Отправляем ACK
-			ackImg := Encode([]byte{typeConnAck, status}, margin)
-			writeToVCam(ackImg)
+					targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+					status := byte(0)
+					if err != nil {
+						log.Printf("Server: dial failed to %s: %v", targetAddr, err)
+						status = 1
+					}
 
-			if status == 0 {
-				log.Printf("Server: Tunnel established for %s", targetAddr)
-				runTunnelWithPrefix(targetConn, video, margin)
-				targetConn.Close()
-				log.Println("Server: Connection closed, waiting for next...")
+					// Отправляем ACK
+					ackImg := Encode([]byte{typeConnAck, status}, margin)
+					writeToVCam(ackImg)
+
+					if status == 0 {
+						log.Printf("Server: Tunnel established for %s", targetAddr)
+						runTunnelWithPrefix(targetConn, video, margin)
+						targetConn.Close()
+						log.Println("Server: Connection closed, waiting for next...")
+						lastData = nil // Сбрасываем после туннеля
+					}
+				}
 			}
 		}
 	}

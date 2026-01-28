@@ -325,6 +325,6 @@ func Decode(img *image.RGBA, margin int) []byte {
 		return nil
 	}
 
-	log.Printf("Codec: Successfully decoded %d bytes: %v", dataLen, fullData[2:2+dataLen])
+	// log.Printf("Codec: Successfully decoded %d bytes: %v", dataLen, fullData[2:2+dataLen])
 	return fullData[2 : 2+dataLen]
 }
