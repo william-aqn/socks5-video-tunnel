@@ -42,6 +42,7 @@ func (s *ScreenVideoConn) Read(p []byte) (n int, err error) {
 
 	img, err := CaptureScreen(curX, curY, width, height)
 	if err != nil {
+		log.Printf("ScreenVideoConn: CaptureScreen error: %v", err)
 		return 0, err
 	}
 
@@ -77,16 +78,13 @@ func writeToVCam(img *image.RGBA) {
 // Также читает видеокадры из videoConn (Screen), распаковывает и пишет в dataConn.
 func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteCloser, margin int) {
 	done := make(chan bool, 2)
+	start := time.Now()
+	var bytesSent, bytesReceived int64
 
 	go func() {
 		defer func() { done <- true }()
 		for {
 			// Оставляем 1 байт под префикс typeData
-			// Учитываем margin и маркеры
-			// Доступные пиксели: (width - 2*margin) * (height - 2*margin) - 4*4 (маркеры 2x2)
-			// На самом деле Encode учитывает маркеры внутри цикла.
-			// Посчитаем точно сколько байт влезает.
-			// Для простоты используем консервативную оценку или вынесем расчет в codec.go
 			maxData := (width * height * 3) - 4 - 1
 			buf := make([]byte, maxData)
 			n, err := dataConn.Read(buf)
@@ -100,6 +98,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 			if _, err := videoConn.Write(img.Pix); err != nil {
 				return
 			}
+			bytesSent += int64(n)
 		}
 	}()
 
@@ -113,18 +112,20 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 			}
 
 			img := &image.RGBA{Pix: buf, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
-			// Мы не вызываем writeToVCam здесь для входящих кадров, так как это может создать бесконечную петлю или шум в камере,
-			// если камера используется и для вывода, и для ввода (но в данной схеме VCam - только выход).
 			data := Decode(img, margin)
 			if len(data) > 0 && data[0] == typeData {
-				if _, err := dataConn.Write(data[1:]); err != nil {
+				n, err := dataConn.Write(data[1:])
+				if err != nil {
 					return
 				}
+				bytesReceived += int64(n)
 			}
 		}
 	}()
 
 	<-done
+	duration := time.Since(start)
+	log.Printf("Tunnel: Closed. Duration: %v, Sent: %d bytes, Received: %d bytes", duration, bytesSent, bytesReceived)
 }
 
 func UpdateActiveCaptureArea(x, y int) {
@@ -138,13 +139,14 @@ func UpdateActiveCaptureArea(x, y int) {
 
 // RunScreenSocksServer работает через захват экрана и VCam с динамическим выбором цели
 func RunScreenSocksServer(x, y, margin int) {
-	fmt.Printf("Server: Watching screen at (%d, %d) with margin %d\n", x, y, margin)
+	log.Printf("Server: Watching screen at (%d, %d) with margin %d", x, y, margin)
 	video := &ScreenVideoConn{X: x, Y: y, Margin: margin}
 
 	activeVideoMu.Lock()
 	activeVideoConn = video
 	activeVideoMu.Unlock()
 
+	frameCount := 0
 	for {
 		frameSize := width * height * 4
 		buf := make([]byte, frameSize)
@@ -155,11 +157,16 @@ func RunScreenSocksServer(x, y, margin int) {
 			continue
 		}
 
+		frameCount++
+		if frameCount%100 == 0 {
+			log.Printf("Server: Heartbeat - Processed %d frames from screen...", frameCount)
+		}
+
 		img := &image.RGBA{Pix: buf, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
 		data := Decode(img, margin)
 		if len(data) > 0 && data[0] == typeConnect {
 			targetAddr := string(data[1:])
-			fmt.Printf("Server: Request to %s\n", targetAddr)
+			log.Printf("Server: Request to %s", targetAddr)
 
 			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 			status := byte(0)
@@ -173,10 +180,10 @@ func RunScreenSocksServer(x, y, margin int) {
 			writeToVCam(ackImg)
 
 			if status == 0 {
-				fmt.Printf("Server: Tunnel established for %s\n", targetAddr)
+				log.Printf("Server: Tunnel established for %s", targetAddr)
 				runTunnelWithPrefix(targetConn, video, margin)
 				targetConn.Close()
-				fmt.Println("Server: Connection closed, waiting for next...")
+				log.Println("Server: Connection closed, waiting for next...")
 			}
 		}
 	}
@@ -188,7 +195,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 	if err != nil {
 		log.Fatalf("Client: failed to listen: %v", err)
 	}
-	fmt.Printf("Client: Listening (SOCKS5) on %s, watching screen at (%d, %d) with margin %d\n", localListenAddr, x, y, margin)
+	log.Printf("Client: Listening (SOCKS5) on %s, watching screen at (%d, %d) with margin %d", localListenAddr, x, y, margin)
 
 	video := &ScreenVideoConn{X: x, Y: y, Margin: margin}
 
@@ -202,6 +209,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			log.Printf("Client: accept error: %v", err)
 			continue
 		}
+		log.Printf("Client: Accepted local connection from %s", localConn.RemoteAddr())
 
 		targetAddr, err := HandleSocksHandshake(localConn)
 		if err != nil {
@@ -215,7 +223,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		writeToVCam(connectImg)
 
 		// 2. Ждем ACK
-		fmt.Printf("Client: Waiting for ACK for %s\n", targetAddr)
+		log.Printf("Client: Waiting for ACK for %s", targetAddr)
 		success := false
 		for i := 0; i < 100; i++ { // Пытаемся 100 раз (около 3 секунд)
 			frameSize := width * height * 4
@@ -243,9 +251,9 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		}
 
 		_ = SendSocksResponse(localConn, nil)
-		fmt.Printf("Client: Tunnel established to %s\n", targetAddr)
+		log.Printf("Client: Tunnel established to %s", targetAddr)
 		runTunnelWithPrefix(localConn, video, margin)
 		localConn.Close()
-		fmt.Println("Client: Connection closed")
+		log.Println("Client: Connection closed")
 	}
 }

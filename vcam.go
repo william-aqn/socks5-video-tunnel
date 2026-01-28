@@ -8,4 +8,5 @@ import (
 type VirtualCamera interface {
 	WriteFrame(img *image.RGBA) error
 	Close() error
+	GetURL() string
 }

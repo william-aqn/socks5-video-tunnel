@@ -6,9 +6,12 @@ package main
 import (
 	"fmt"
 	"image"
+	"log"
 	"syscall"
 	"unsafe"
 )
+
+var staticEmptyFrames int
 
 var (
 	moduser32 = syscall.NewLazyDLL("user32.dll")
@@ -102,6 +105,21 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 
 	if ret == 0 {
 		return nil, fmt.Errorf("GetDIBits failed")
+	}
+
+	// Проверим, не пустой ли кадр (хотя бы примерно)
+	hasData := false
+	for i := 0; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0 || img.Pix[i+1] != 0 || img.Pix[i+2] != 0 {
+			hasData = true
+			break
+		}
+	}
+	if !hasData {
+		staticEmptyFrames++
+		if staticEmptyFrames%1000 == 0 {
+			log.Printf("CaptureScreen: Captured 1000 empty (black) frames from (%d, %d)", x, y)
+		}
 	}
 
 	// GetDIBits returns BGRA, image.RGBA expects RGBA

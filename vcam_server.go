@@ -20,8 +20,8 @@ type MJPEGServer struct {
 	clientMu sync.Mutex
 }
 
-func NewMJPEGServer() (*MJPEGServer, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func NewMJPEGServer(port int) (*MJPEGServer, error) {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return nil, err
 	}
@@ -41,6 +41,7 @@ func (s *MJPEGServer) run() {
 }
 
 func (s *MJPEGServer) handler(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("MJPEG: Client connected from %s\n", r.RemoteAddr)
 	m := multipart.NewWriter(w)
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+m.Boundary())
 
@@ -50,6 +51,7 @@ func (s *MJPEGServer) handler(w http.ResponseWriter, r *http.Request) {
 	s.clientMu.Unlock()
 
 	defer func() {
+		fmt.Printf("MJPEG: Client disconnected from %s\n", r.RemoteAddr)
 		s.clientMu.Lock()
 		delete(s.clients, ch)
 		s.clientMu.Unlock()

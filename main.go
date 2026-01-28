@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 )
 
@@ -14,6 +16,10 @@ type Config struct {
 	UseMJPEG  bool   `json:"use_mjpeg"`
 	UseNative bool   `json:"use_native"`
 	VCamName  string `json:"vcam_name"`
+	DebugURL  string `json:"debug_url"`
+	VCamPort  int    `json:"vcam_port"`
+	DebugX    int    `json:"debug_x"`
+	DebugY    int    `json:"debug_y"`
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -24,6 +30,10 @@ func loadConfig(filename string) (*Config, error) {
 	cfg := Config{
 		UseMJPEG:  true,
 		UseNative: true,
+		DebugURL:  "http://127.0.0.1:8080", // Default guess
+		VCamPort:  0,
+		DebugX:    200,
+		DebugY:    200,
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
@@ -55,12 +65,25 @@ func main() {
 	useMJPEG := flag.Bool("vcam-mjpeg", true, "Enable MJPEG server")
 	useNative := flag.Bool("vcam-native", true, "Enable native Virtual Camera registration (Windows only)")
 	vcamName := flag.String("vcam-name", "", "Name of the virtual camera")
+	vcamPort := flag.Int("vcam-port", -1, "MJPEG server port (0 for random)")
+	debugUI := flag.Bool("debug-ui", false, "Open debug UI to view video stream")
+	debugURL := flag.String("debug-url", "", "MJPEG URL to view in debug UI")
+	debugX := flag.Int("debug-x", -1, "X position for debug UI window")
+	debugY := flag.Int("debug-y", -1, "Y position for debug UI window")
 
 	flag.Parse()
 
 	if *mode == "" {
 		fmt.Println("Please specify mode: -mode=server or -mode=client")
 		os.Exit(1)
+	}
+
+	// Настройка логирования в файл
+	logFile, err := os.OpenFile(fmt.Sprintf("%s_vgo.log", *mode), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+		log.Printf("--- Starting %s session ---", *mode)
 	}
 
 	cfgFile = fmt.Sprintf("config_%s.json", *mode)
@@ -71,6 +94,10 @@ func main() {
 	finalUseMJPEG := *useMJPEG
 	finalUseNative := *useNative
 	finalVCamName := *vcamName
+	finalDebugURL := *debugURL
+	finalVCamPort := *vcamPort
+	finalDebugX := *debugX
+	finalDebugY := *debugY
 
 	isMJPEGSet := false
 	isNativeSet := false
@@ -118,6 +145,33 @@ func main() {
 			finalVCamName = "VideoGo Client Camera"
 		}
 	}
+	if finalDebugURL == "" && loadedCfg != nil {
+		finalDebugURL = loadedCfg.DebugURL
+		if finalDebugURL != "" {
+			fmt.Printf("Loaded Debug URL from %s: %s\n", cfgFile, finalDebugURL)
+		}
+	}
+	if finalVCamPort == -1 {
+		if loadedCfg != nil {
+			finalVCamPort = loadedCfg.VCamPort
+		} else {
+			finalVCamPort = 0
+		}
+	}
+	if finalDebugX == -1 {
+		if loadedCfg != nil {
+			finalDebugX = loadedCfg.DebugX
+		} else {
+			finalDebugX = 200
+		}
+	}
+	if finalDebugY == -1 {
+		if loadedCfg != nil {
+			finalDebugY = loadedCfg.DebugY
+		} else {
+			finalDebugY = 200
+		}
+	}
 
 	if *useUI || (finalX == -1 && finalY == -1) {
 		fmt.Println("Please select capture area using the window...")
@@ -142,12 +196,17 @@ func main() {
 		UseMJPEG:  finalUseMJPEG,
 		UseNative: finalUseNative,
 		VCamName:  finalVCamName,
+		DebugURL:  finalDebugURL,
+		VCamPort:  finalVCamPort,
+		DebugX:    finalDebugX,
+		DebugY:    finalDebugY,
 	}
 
 	// Сохраняем конфиг, если он изменился или не существовал
 	if loadedCfg == nil || loadedCfg.CaptureX != finalX || loadedCfg.CaptureY != finalY ||
 		loadedCfg.Margin != finalMargin || loadedCfg.UseMJPEG != finalUseMJPEG || loadedCfg.UseNative != finalUseNative ||
-		loadedCfg.VCamName != finalVCamName {
+		loadedCfg.VCamName != finalVCamName || loadedCfg.DebugURL != finalDebugURL ||
+		loadedCfg.VCamPort != finalVCamPort || loadedCfg.DebugX != finalDebugX || loadedCfg.DebugY != finalDebugY {
 		err := saveConfig(cfgFile, currentCfg)
 		if err != nil {
 			fmt.Printf("Warning: failed to save config: %v\n", err)
@@ -174,13 +233,24 @@ func main() {
 	})
 
 	// Инициализируем виртуальную камеру, она нужна в обоих режимах
-	cam, err := NewVirtualCamera(width, height, finalUseMJPEG, finalUseNative, finalVCamName)
+	cam, err := NewVirtualCamera(width, height, finalUseMJPEG, finalUseNative, finalVCamName, finalVCamPort)
 	if err != nil {
 		fmt.Printf("Warning: Failed to initialize virtual camera system: %v\n", err)
 	} else {
 		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
 		defer cam.Close()
+	}
+
+	if *debugUI {
+		localURL := ""
+		if vcam != nil {
+			localURL = vcam.GetURL()
+		}
+		go StartDebugUI(*mode, finalDebugURL, localURL, finalDebugX, finalDebugY, func(newURL string) {
+			currentCfg.DebugURL = newURL
+			saveConfig(cfgFile, currentCfg)
+		})
 	}
 
 	switch *mode {

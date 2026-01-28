@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 )
@@ -41,6 +42,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 	}
 
 	fullData := append(header, data...)
+	fmt.Printf("Codec: Encoding %d bytes of data\n", len(data))
 
 	idx := 0
 	for y := margin; y < height-margin; y++ {
@@ -99,5 +101,6 @@ func Decode(img *image.RGBA, margin int) []byte {
 		return nil
 	}
 
+	fmt.Printf("Codec: Decoded %d bytes of data\n", dataLen)
 	return fullData[4 : 4+dataLen]
 }

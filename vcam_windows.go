@@ -38,12 +38,11 @@ type WindowsVirtualCamera struct {
 	mu     sync.Mutex
 }
 
-func NewVirtualCamera(w, h int, useMJPEG, useNative bool, name string) (VirtualCamera, error) {
+func NewVirtualCamera(w, h int, useMJPEG, useNative bool, name string, mjpegPort int) (VirtualCamera, error) {
 	var server *MJPEGServer
 	var err error
-
 	if useMJPEG || useNative {
-		server, err = NewMJPEGServer()
+		server, err = NewMJPEGServer(mjpegPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start MJPEG server: %v", err)
 		}
@@ -101,6 +100,13 @@ func (c *WindowsVirtualCamera) WriteFrame(img *image.RGBA) error {
 		c.server.Broadcast(img)
 	}
 	return nil
+}
+
+func (c *WindowsVirtualCamera) GetURL() string {
+	if c.server != nil {
+		return c.server.URL()
+	}
+	return ""
 }
 
 func (c *WindowsVirtualCamera) Close() error {

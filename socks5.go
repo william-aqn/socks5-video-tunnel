@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 )
 
@@ -18,6 +19,7 @@ const (
 
 // HandleSocksHandshake выполняет рукопожатие SOCKS5 и возвращает адрес назначения.
 func HandleSocksHandshake(conn net.Conn) (string, error) {
+	log.Printf("SOCKS5: Start handshake from %s", conn.RemoteAddr())
 	// 1. Выбор метода
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -83,8 +85,9 @@ func HandleSocksHandshake(conn net.Conn) (string, error) {
 		return "", err
 	}
 	port := binary.BigEndian.Uint16(portBuf)
-
-	return fmt.Sprintf("%s:%d", addr, port), nil
+	target := fmt.Sprintf("%s:%d", addr, port)
+	log.Printf("SOCKS5: Handshake successful for %s", target)
+	return target, nil
 }
 
 // SendSocksResponse отправляет ответ SOCKS5 клиенту.
@@ -92,6 +95,9 @@ func SendSocksResponse(conn net.Conn, err error) error {
 	rep := byte(0x00) // Success
 	if err != nil {
 		rep = 0x01 // General SOCKS server failure
+		log.Printf("SOCKS5: Sending error response: %v", err)
+	} else {
+		log.Printf("SOCKS5: Sending success response")
 	}
 
 	// Ответ: VER, REP, RSV, ATYP, BND.ADDR (4 bytes 0), BND.PORT (2 bytes 0)
