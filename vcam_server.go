@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -89,6 +90,7 @@ func (s *MJPEGServer) Broadcast(img *image.RGBA) {
 	s.current = img
 	s.currentEncoded = w.b
 	s.mu.Unlock()
+	log.Printf("MJPEG: Broadcasted new frame (%d bytes)", len(w.b))
 }
 
 type bufferWriter struct {

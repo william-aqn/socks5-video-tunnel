@@ -22,10 +22,10 @@ $ClientMJPEGPort = 9001
 $SOCKS5Port = 1080
 
 # Window Positions
-$ServerDebugX = 1200
+$ServerDebugX = 100
 $ServerDebugY = 100
-$ClientDebugX = 1200
-$ClientDebugY = 650
+$ClientDebugX = 1000
+$ClientDebugY = 100
 
 # Offsets for capturing video from the Debug UI window
 # Window frames are ~8px, title bar ~31px, and the video itself is offset by 25px in the client area.

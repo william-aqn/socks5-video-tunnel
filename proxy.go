@@ -28,8 +28,8 @@ type ScreenVideoConn struct {
 }
 
 func (s *ScreenVideoConn) Read(p []byte) (n int, err error) {
-	// Ожидаем, что p имеет размер width * height * 4
-	if len(p) < width*height*4 {
+	// Ожидаем, что p имеет размер captureWidth * captureHeight * 4
+	if len(p) < captureWidth*captureHeight*4 {
 		return 0, io.ErrShortBuffer
 	}
 
@@ -40,14 +40,15 @@ func (s *ScreenVideoConn) Read(p []byte) (n int, err error) {
 	curX, curY := s.X, s.Y
 	activeVideoMu.RUnlock()
 
-	img, err := CaptureScreen(curX, curY, width, height)
+	// Захватываем чуть больше, чтобы компенсировать смещения рамок и DPI
+	img, err := CaptureScreen(curX, curY, captureWidth, captureHeight)
 	if err != nil {
 		log.Printf("ScreenVideoConn: CaptureScreen error: %v", err)
 		return 0, err
 	}
 
 	copy(p, img.Pix)
-	return width * height * 4, nil
+	return captureWidth * captureHeight * 4, nil
 }
 
 func (s *ScreenVideoConn) Write(p []byte) (n int, err error) {
@@ -84,9 +85,8 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	go func() {
 		defer func() { done <- true }()
 		for {
-			// С новым кодеком (blockSize=4) у нас около 2000 байт на кадр.
-			// Оставляем запас и 1 байт под префикс.
-			maxData := 2000
+			// С новым кодеком (blockSize=8) у нас около 500 байт на кадр.
+			maxData := 500
 			buf := make([]byte, maxData)
 			n, err := dataConn.Read(buf)
 			if err != nil {
@@ -106,13 +106,13 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	go func() {
 		defer func() { done <- true }()
 		for {
-			frameSize := width * height * 4
+			frameSize := captureWidth * captureHeight * 4
 			buf := make([]byte, frameSize)
 			if _, err := io.ReadFull(videoConn, buf); err != nil {
 				return
 			}
 
-			img := &image.RGBA{Pix: buf, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
+			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 			data := Decode(img, margin)
 			if len(data) > 0 && data[0] == typeData {
 				n, err := dataConn.Write(data[1:])
@@ -149,7 +149,7 @@ func RunScreenSocksServer(x, y, margin int) {
 
 	frameCount := 0
 	for {
-		frameSize := width * height * 4
+		frameSize := captureWidth * captureHeight * 4
 		buf := make([]byte, frameSize)
 		_, err := io.ReadFull(video, buf)
 		if err != nil {
@@ -163,8 +163,11 @@ func RunScreenSocksServer(x, y, margin int) {
 			log.Printf("Server: Heartbeat - Processed %d frames from screen...", frameCount)
 		}
 
-		img := &image.RGBA{Pix: buf, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
+		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 		data := Decode(img, margin)
+		if data != nil {
+			log.Printf("Server: Decoded %d bytes from screen", len(data))
+		}
 		if len(data) > 0 && data[0] == typeConnect {
 			targetAddr := string(data[1:])
 			log.Printf("Server: Request to %s", targetAddr)
@@ -227,13 +230,13 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		log.Printf("Client: Waiting for ACK for %s", targetAddr)
 		success := false
 		for i := 0; i < 300; i++ { // Пытаемся 300 раз (около 10 секунд)
-			frameSize := width * height * 4
+			frameSize := captureWidth * captureHeight * 4
 			buf := make([]byte, frameSize)
 			_, err := io.ReadFull(video, buf)
 			if err != nil {
 				break
 			}
-			img := &image.RGBA{Pix: buf, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
+			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 			ackData := Decode(img, margin)
 			if len(ackData) >= 2 && ackData[0] == typeConnAck {
 				if ackData[1] == 0 {

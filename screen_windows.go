@@ -107,9 +107,15 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 		return nil, fmt.Errorf("GetDIBits failed")
 	}
 
+	// Установим Alpha в 255, так как GDI её часто зануляет, а image.RGBA её учитывает
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = 255
+	}
+
 	// Проверим, не пустой ли кадр (хотя бы примерно)
 	hasData := false
 	for i := 0; i < len(img.Pix); i += 4 {
+		// Игнорируем Alpha при проверке на пустоту
 		if img.Pix[i] != 0 || img.Pix[i+1] != 0 || img.Pix[i+2] != 0 {
 			hasData = true
 			break

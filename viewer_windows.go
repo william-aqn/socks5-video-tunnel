@@ -11,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -36,11 +37,13 @@ const (
 type ViewerState struct {
 	url         string
 	onURLChange func(string)
-	currentImg  *image.RGBA
 	mu          sync.RWMutex
 	hwnd        syscall.Handle
 	hwndEdit    syscall.Handle
+	hwndStatus  syscall.Handle
 	currentBody io.Closer
+	gdiBuf      []byte
+	gdiW, gdiH  int32
 }
 
 var viewer ViewerState
@@ -64,22 +67,8 @@ func viewerWndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uint
 		hdc, _, _ := procBeginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 		if hdc != 0 {
 			viewer.mu.RLock()
-			img := viewer.currentImg
-			var displayPix []byte
-			var w, h int32
-			if img != nil {
-				w, h = int32(img.Bounds().Dx()), int32(img.Bounds().Dy())
-				displayPix = make([]byte, len(img.Pix))
-				copy(displayPix, img.Pix)
-			}
-			viewer.mu.RUnlock()
-
-			if displayPix != nil {
-				// Нам нужно подготовить данные для SetDIBitsToDevice.
-				for i := 0; i < len(displayPix); i += 4 {
-					displayPix[i], displayPix[i+2] = displayPix[i+2], displayPix[i]
-				}
-
+			if viewer.gdiBuf != nil {
+				w, h := viewer.gdiW, viewer.gdiH
 				var bi BITMAPINFO
 				bi.Header.Size = uint32(unsafe.Sizeof(bi.Header))
 				bi.Header.Width = w
@@ -92,11 +81,12 @@ func viewerWndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uint
 					hdc,
 					0, 25, uintptr(w), uintptr(h), // Смещение 25 для UI
 					0, 0, 0, uintptr(h),
-					uintptr(unsafe.Pointer(&displayPix[0])),
+					uintptr(unsafe.Pointer(&viewer.gdiBuf[0])),
 					uintptr(unsafe.Pointer(&bi)),
 					DIB_RGB_COLORS,
 				)
 			}
+			viewer.mu.RUnlock()
 			procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 		}
 		return 0
@@ -122,6 +112,7 @@ func viewerWndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uint
 }
 
 func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(string)) {
+	runtime.LockOSThread()
 	viewer.url = initialURL
 	viewer.onURLChange = onURLChange
 
@@ -144,12 +135,19 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 	wc.Size = uint32(unsafe.Sizeof(wc))
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
+	// Рассчитываем размер окна для нужной клиентской области
+	// 640x(480 + 25 сверху для URL + 25 снизу для статуса)
+	rect := RECT{0, 0, int32(width), int32(height + 50)}
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&rect)), WS_OVERLAPPEDWINDOW, 0, WS_EX_TOPMOST)
+	winW := rect.Right - rect.Left
+	winH := rect.Bottom - rect.Top
+
 	hwnd, _, _ := procCreateWindowExW.Call(
 		WS_EX_TOPMOST,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
 		WS_OVERLAPPEDWINDOW|WS_VISIBLE,
-		uintptr(x), uintptr(y), uintptr(width+16), uintptr(height+60), // Чуть больше для UI элементов
+		uintptr(x), uintptr(y), uintptr(winW), uintptr(winH),
 		0, 0, instance, 0,
 	)
 
@@ -183,6 +181,18 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 		uintptr(width-100), 0, 100, 25,
 		hwnd, 1001, instance, 0,
 	)
+
+	// Поле статуса (Heartbeat)
+	statusClassName, _ := syscall.UTF16PtrFromString("STATIC")
+	hwndStatus, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(statusClassName)),
+		0,
+		WS_CHILD|WS_VISIBLE,
+		0, uintptr(height+25), uintptr(width), 25,
+		hwnd, 0, instance, 0,
+	)
+	viewer.hwndStatus = syscall.Handle(hwndStatus)
 
 	go runMJPEGClient()
 
@@ -237,6 +247,7 @@ func runMJPEGClient() {
 		}
 
 		mr := multipart.NewReader(resp.Body, boundary)
+		frameCount := 0
 		for {
 			part, err := mr.NextPart()
 			if err != nil {
@@ -245,6 +256,12 @@ func runMJPEGClient() {
 			img, err := jpeg.Decode(part)
 			if err != nil {
 				continue
+			}
+
+			frameCount++
+			if frameCount%10 == 0 {
+				statusText, _ := syscall.UTF16PtrFromString(fmt.Sprintf("Live: %s | Frames: %d", time.Now().Format("15:04:05"), frameCount))
+				procSetWindowTextW.Call(uintptr(viewer.hwndStatus), uintptr(unsafe.Pointer(statusText)))
 			}
 
 			rgba, ok := img.(*image.RGBA)
@@ -258,8 +275,18 @@ func runMJPEGClient() {
 				}
 			}
 
+			// Подготавливаем буфер для GDI (BGR)
+			w, h := int32(rgba.Bounds().Dx()), int32(rgba.Bounds().Dy())
+			pix := make([]byte, len(rgba.Pix))
+			copy(pix, rgba.Pix)
+			for i := 0; i < len(pix); i += 4 {
+				pix[i], pix[i+2] = pix[i+2], pix[i]
+			}
+
 			viewer.mu.Lock()
-			viewer.currentImg = rgba
+			viewer.gdiBuf = pix
+			viewer.gdiW = w
+			viewer.gdiH = h
 			viewer.mu.Unlock()
 
 			procInvalidateRect.Call(uintptr(viewer.hwnd), 0, 0)

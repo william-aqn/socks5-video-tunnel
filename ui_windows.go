@@ -27,6 +27,7 @@ var (
 	procLoadCursorW                = moduser32.NewProc("LoadCursorW")
 	procEnumWindows                = moduser32.NewProc("EnumWindows")
 	procIsWindowVisible            = moduser32.NewProc("IsWindowVisible")
+	procAdjustWindowRectEx         = moduser32.NewProc("AdjustWindowRectEx")
 )
 
 const (
@@ -125,12 +126,18 @@ func SelectCaptureArea() (int, int, error) {
 
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
+	// Рассчитываем размер окна для клиентской области width x height
+	rect := RECT{0, 0, int32(width), int32(height)}
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&rect)), WS_OVERLAPPEDWINDOW, 0, WS_EX_LAYERED|WS_EX_TOPMOST)
+	winW := rect.Right - rect.Left
+	winH := rect.Bottom - rect.Top
+
 	hwnd, _, _ := procCreateWindowExW.Call(
 		WS_EX_LAYERED|WS_EX_TOPMOST,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
 		WS_OVERLAPPEDWINDOW,
-		100, 100, uintptr(width+16), uintptr(height+39), // Добавляем размер рамок окна
+		100, 100, uintptr(winW), uintptr(winH),
 		0, 0, instance, 0,
 	)
 
@@ -170,7 +177,7 @@ func SelectCaptureArea() (int, int, error) {
 	// Для простоты: захватываем то, что внутри рамки.
 	// Обычно ClientToScreen(hwnd, &point{0,0}) дает координаты верхнего левого угла клиентской области.
 
-	return selectedX + 8, selectedY + 31, nil
+	return selectedX - int(rect.Left), selectedY - int(rect.Top), nil
 }
 
 func FindCaptureWindow(titlePrefix string) (int, int, error) {
@@ -188,9 +195,15 @@ func FindCaptureWindow(titlePrefix string) (int, int, error) {
 				procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
 				// Окно VideoGo Debug Viewer имеет заголовок и рамки.
 				// Нам нужны координаты клиентской области, где отрисовывается видео.
-				// С учетом наших расчетов: 8 пикселей сбоку и 56 пикселей сверху (заголовок + edit box).
-				foundX = int(rect.Left) + 8
-				foundY = int(rect.Top) + 56
+				// Используем AdjustWindowRectEx для определения размеров рамок.
+				adjRect := RECT{0, 0, 100, 100}
+				procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&adjRect)), WS_OVERLAPPEDWINDOW, 0, WS_EX_TOPMOST)
+
+				borderLeft := -adjRect.Left
+				borderTop := -adjRect.Top
+
+				foundX = int(rect.Left) + int(borderLeft)
+				foundY = int(rect.Top) + int(borderTop) + 25 // 25 пикселей для поля ввода URL
 				found = true
 				return 0 // Остановить перечисление
 			}
