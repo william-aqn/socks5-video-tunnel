@@ -25,6 +25,8 @@ var (
 	procGetWindowRect              = moduser32.NewProc("GetWindowRect")
 	procSetWindowTextW             = moduser32.NewProc("SetWindowTextW")
 	procLoadCursorW                = moduser32.NewProc("LoadCursorW")
+	procEnumWindows                = moduser32.NewProc("EnumWindows")
+	procIsWindowVisible            = moduser32.NewProc("IsWindowVisible")
 )
 
 const (
@@ -169,4 +171,38 @@ func SelectCaptureArea() (int, int, error) {
 	// Обычно ClientToScreen(hwnd, &point{0,0}) дает координаты верхнего левого угла клиентской области.
 
 	return selectedX + 8, selectedY + 31, nil
+}
+
+func FindCaptureWindow(titlePrefix string) (int, int, error) {
+	var foundX, foundY int
+	var found bool
+
+	callback := syscall.NewCallback(func(hwnd syscall.Handle, lparam uintptr) uintptr {
+		visible, _, _ := procIsWindowVisible.Call(uintptr(hwnd))
+		if visible != 0 {
+			var buf [256]uint16
+			procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), 256)
+			title := syscall.UTF16ToString(buf[:])
+			if title != "" && len(title) >= len(titlePrefix) && title[:len(titlePrefix)] == titlePrefix {
+				var rect RECT
+				procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
+				// Окно VideoGo Debug Viewer имеет заголовок и рамки.
+				// Нам нужны координаты клиентской области, где отрисовывается видео.
+				// С учетом наших расчетов: 8 пикселей сбоку и 56 пикселей сверху (заголовок + edit box).
+				foundX = int(rect.Left) + 8
+				foundY = int(rect.Top) + 56
+				found = true
+				return 0 // Остановить перечисление
+			}
+		}
+		return 1
+	})
+
+	procEnumWindows.Call(callback, 0)
+
+	if !found {
+		return 0, 0, fmt.Errorf("window not found with prefix: %s", titlePrefix)
+	}
+
+	return foundX, foundY, nil
 }

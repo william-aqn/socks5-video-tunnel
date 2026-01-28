@@ -145,7 +145,7 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
 	hwnd, _, _ := procCreateWindowExW.Call(
-		0,
+		WS_EX_TOPMOST,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
 		WS_OVERLAPPEDWINDOW|WS_VISIBLE,

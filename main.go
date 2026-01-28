@@ -7,6 +7,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"syscall"
+	"time"
+)
+
+var (
+	user32                 = syscall.NewLazyDLL("user32.dll")
+	procSetProcessDPIAware = user32.NewProc("SetProcessDPIAware")
 )
 
 type Config struct {
@@ -56,6 +63,7 @@ var (
 )
 
 func main() {
+	procSetProcessDPIAware.Call()
 	mode := flag.String("mode", "", "Mode: server or client")
 	localAddr := flag.String("local", ":1080", "Local SOCKS5 listen address (for client mode)")
 	captureX := flag.Int("capture-x", -1, "X coordinate for screen capture")
@@ -239,6 +247,8 @@ func main() {
 	} else {
 		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
+		// Отправим пустой кадр для инициализации MJPEG сервера
+		vcam.WriteFrame(Encode(nil, finalMargin))
 		defer cam.Close()
 	}
 
@@ -251,6 +261,32 @@ func main() {
 			currentCfg.DebugURL = newURL
 			saveConfig(cfgFile, currentCfg)
 		})
+	}
+
+	if *mode == "server" {
+		targetPrefix := "VideoGo Debug Viewer [client]"
+		log.Printf("Server: Searching for client window '%s'...", targetPrefix)
+		for i := 0; i < 30; i++ {
+			x, y, err := FindCaptureWindow(targetPrefix)
+			if err == nil {
+				log.Printf("Server: Found client window at (%d, %d)", x, y)
+				finalX, finalY = x, y
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	} else if *mode == "client" {
+		targetPrefix := "VideoGo Debug Viewer [server]"
+		log.Printf("Client: Searching for server window '%s'...", targetPrefix)
+		for i := 0; i < 30; i++ {
+			x, y, err := FindCaptureWindow(targetPrefix)
+			if err == nil {
+				log.Printf("Client: Found server window at (%d, %d)", x, y)
+				finalX, finalY = x, y
+				break
+			}
+			time.Sleep(time.Second)
+		}
 	}
 
 	switch *mode {

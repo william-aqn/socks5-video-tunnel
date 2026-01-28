@@ -9,15 +9,17 @@ import (
 	"net/http"
 	"net/textproto"
 	"sync"
+	"time"
 )
 
 type MJPEGServer struct {
-	listener net.Listener
-	port     int
-	current  *image.RGBA
-	mu       sync.RWMutex
-	clients  map[chan []byte]bool
-	clientMu sync.Mutex
+	listener       net.Listener
+	port           int
+	current        *image.RGBA
+	currentEncoded []byte
+	mu             sync.RWMutex
+	clients        map[chan []byte]bool
+	clientMu       sync.Mutex
 }
 
 func NewMJPEGServer(port int) (*MJPEGServer, error) {
@@ -45,22 +47,20 @@ func (s *MJPEGServer) handler(w http.ResponseWriter, r *http.Request) {
 	m := multipart.NewWriter(w)
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+m.Boundary())
 
-	ch := make(chan []byte, 1)
-	s.clientMu.Lock()
-	s.clients[ch] = true
-	s.clientMu.Unlock()
-
 	defer func() {
 		fmt.Printf("MJPEG: Client disconnected from %s\n", r.RemoteAddr)
-		s.clientMu.Lock()
-		delete(s.clients, ch)
-		s.clientMu.Unlock()
 	}()
 
-	for {
-		imgData, ok := <-ch
-		if !ok {
-			return
+	ticker := time.NewTicker(33 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.RLock()
+		imgData := s.currentEncoded
+		s.mu.RUnlock()
+
+		if imgData == nil {
+			continue
 		}
 
 		partHeader := make(textproto.MIMEHeader)
@@ -77,28 +77,18 @@ func (s *MJPEGServer) handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *MJPEGServer) Broadcast(img *image.RGBA) {
-	s.mu.Lock()
-	s.current = img
-	s.mu.Unlock()
-
 	// Кодируем в JPEG
-	// Используем простой буфер для начала
 	var b []byte
 	w := &bufferWriter{b: b}
-	err := jpeg.Encode(w, img, &jpeg.Options{Quality: 80})
+	err := jpeg.Encode(w, img, &jpeg.Options{Quality: 100})
 	if err != nil {
 		return
 	}
 
-	s.clientMu.Lock()
-	for ch := range s.clients {
-		select {
-		case ch <- w.b:
-		default:
-			// Пропускаем кадр для медленных клиентов
-		}
-	}
-	s.clientMu.Unlock()
+	s.mu.Lock()
+	s.current = img
+	s.currentEncoded = w.b
+	s.mu.Unlock()
 }
 
 type bufferWriter struct {

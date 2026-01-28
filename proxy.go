@@ -84,8 +84,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	go func() {
 		defer func() { done <- true }()
 		for {
-			// Оставляем 1 байт под префикс typeData
-			maxData := (width * height * 3) - 4 - 1
+			// С новым кодеком (blockSize=4) у нас около 2000 байт на кадр.
+			// Оставляем запас и 1 байт под префикс.
+			maxData := 2000
 			buf := make([]byte, maxData)
 			n, err := dataConn.Read(buf)
 			if err != nil {
@@ -225,7 +226,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		// 2. Ждем ACK
 		log.Printf("Client: Waiting for ACK for %s", targetAddr)
 		success := false
-		for i := 0; i < 100; i++ { // Пытаемся 100 раз (около 3 секунд)
+		for i := 0; i < 300; i++ { // Пытаемся 300 раз (около 10 секунд)
 			frameSize := width * height * 4
 			buf := make([]byte, frameSize)
 			_, err := io.ReadFull(video, buf)

@@ -22,31 +22,22 @@ $ClientMJPEGPort = 9001
 $SOCKS5Port = 1080
 
 # Window Positions
-$ServerDebugX = 100
+$ServerDebugX = 1200
 $ServerDebugY = 100
-$ClientDebugX = 800
-$ClientDebugY = 100
+$ClientDebugX = 1200
+$ClientDebugY = 650
 
 # Offsets for capturing video from the Debug UI window
 # Window frames are ~8px, title bar ~31px, and the video itself is offset by 25px in the client area.
 $OffsetX = 8
 $OffsetY = 31 + 25 # 56
 
-# Server will capture Client's video
-$ServerCaptureX = $ClientDebugX + $OffsetX
-$ServerCaptureY = $ClientDebugY + $OffsetY
-
-# Client will capture Server's video
-$ClientCaptureX = $ServerDebugX + $OffsetX
-$ClientCaptureY = $ServerDebugY + $OffsetY
-
-Write-Host "--- Starting Server ---"
-# Server uses Client's MJPEG stream as input
-Start-Process $ExePath -ArgumentList "-mode=server", "-vcam-port=$ServerMJPEGPort", "-debug-ui", "-debug-x=$ServerDebugX", "-debug-y=$ServerDebugY", "-debug-url=http://127.0.0.1:$ClientMJPEGPort", "-capture-x=$ServerCaptureX", "-capture-y=$ServerCaptureY" -WorkingDirectory $ScriptDir
+# Server will capture Client's video automatically by title
+Start-Process $ExePath -ArgumentList "-mode=server", "-vcam-port=$ServerMJPEGPort", "-debug-ui", "-debug-x=$ServerDebugX", "-debug-y=$ServerDebugY", "-debug-url=http://127.0.0.1:$ClientMJPEGPort" -WorkingDirectory $ScriptDir
 
 Write-Host "--- Starting Client ---"
-# Client uses Server's MJPEG stream as input
-Start-Process $ExePath -ArgumentList "-mode=client", "-local=:$SOCKS5Port", "-vcam-port=$ClientMJPEGPort", "-debug-ui", "-debug-x=$ClientDebugX", "-debug-y=$ClientDebugY", "-debug-url=http://127.0.0.1:$ServerMJPEGPort", "-capture-x=$ClientCaptureX", "-capture-y=$ClientCaptureY" -WorkingDirectory $ScriptDir
+# Client will capture Server's video automatically by title
+Start-Process $ExePath -ArgumentList "-mode=client", "-local=:$SOCKS5Port", "-vcam-port=$ClientMJPEGPort", "-debug-ui", "-debug-x=$ClientDebugX", "-debug-y=$ClientDebugY", "-debug-url=http://127.0.0.1:$ServerMJPEGPort" -WorkingDirectory $ScriptDir
 
 Write-Host ""
 Write-Host "Playground is running!"
