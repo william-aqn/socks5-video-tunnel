@@ -9,12 +9,13 @@ import (
 const (
 	width         = 640
 	height        = 480
-	blockSize     = 8
 	captureWidth  = 1024
 	captureHeight = 1024
 	markerSize    = 8
 	markerOffset  = 4
 )
+
+var blockSize = 4
 
 type ColorRange struct {
 	rMin, rMax, gMin, gMax, bMin, bMax int
@@ -149,7 +150,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 	drawMarker(markerOffset, height-markerSize-markerOffset, markers.BL)
 	drawMarker(width-markerSize-markerOffset, height-markerSize-markerOffset, markers.BR)
 
-	// Длина данных (2 байта достаточно для такого метода, макс ~2400 байт)
+	// Длина данных (2 байта достаточно для такого метода, макс ~8000 байт при blockSize=4)
 	dataLen := len(data)
 	header := []byte{
 		byte(dataLen >> 8),
@@ -310,7 +311,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 
 	dataLen := int(fullData[0])<<8 | int(fullData[1])
-	if dataLen < 0 || dataLen > 2000 {
+	if dataLen < 0 || dataLen > 8000 {
 		return nil
 	}
 	if dataLen > len(fullData)-3 { // -2 для длины, -1 для CRC

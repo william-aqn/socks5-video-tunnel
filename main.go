@@ -17,16 +17,18 @@ var (
 )
 
 type Config struct {
-	CaptureX  int    `json:"capture_x"`
-	CaptureY  int    `json:"capture_y"`
-	Margin    int    `json:"margin"`
-	UseMJPEG  bool   `json:"use_mjpeg"`
-	UseNative bool   `json:"use_native"`
-	VCamName  string `json:"vcam_name"`
-	DebugURL  string `json:"debug_url"`
-	VCamPort  int    `json:"vcam_port"`
-	DebugX    int    `json:"debug_x"`
-	DebugY    int    `json:"debug_y"`
+	CaptureX          int    `json:"capture_x"`
+	CaptureY          int    `json:"capture_y"`
+	Margin            int    `json:"margin"`
+	UseMJPEG          bool   `json:"use_mjpeg"`
+	UseNative         bool   `json:"use_native"`
+	VCamName          string `json:"vcam_name"`
+	DebugURL          string `json:"debug_url"`
+	VCamPort          int    `json:"vcam_port"`
+	DebugX            int    `json:"debug_x"`
+	DebugY            int    `json:"debug_y"`
+	HeartbeatInterval int    `json:"heartbeat_interval"`
+	BlockSize         int    `json:"block_size"`
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -35,12 +37,14 @@ func loadConfig(filename string) (*Config, error) {
 		return nil, err
 	}
 	cfg := Config{
-		UseMJPEG:  true,
-		UseNative: true,
-		DebugURL:  "http://127.0.0.1:8080", // Default guess
-		VCamPort:  0,
-		DebugX:    200,
-		DebugY:    200,
+		UseMJPEG:          true,
+		UseNative:         true,
+		DebugURL:          "http://127.0.0.1:8080", // Default guess
+		VCamPort:          0,
+		DebugX:            200,
+		DebugY:            200,
+		HeartbeatInterval: 30,
+		BlockSize:         4,
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
@@ -78,6 +82,7 @@ func main() {
 	debugURL := flag.String("debug-url", "", "MJPEG URL to view in debug UI")
 	debugX := flag.Int("debug-x", -1, "X position for debug UI window")
 	debugY := flag.Int("debug-y", -1, "Y position for debug UI window")
+	blockSizeFlag := flag.Int("block-size", -1, "Size of data blocks in pixels")
 
 	flag.Parse()
 
@@ -106,6 +111,7 @@ func main() {
 	finalVCamPort := *vcamPort
 	finalDebugX := *debugX
 	finalDebugY := *debugY
+	finalBlockSize := *blockSizeFlag
 
 	isMJPEGSet := false
 	isNativeSet := false
@@ -180,6 +186,19 @@ func main() {
 			finalDebugY = 200
 		}
 	}
+	if finalBlockSize == -1 {
+		if loadedCfg != nil && loadedCfg.BlockSize > 0 {
+			finalBlockSize = loadedCfg.BlockSize
+		} else {
+			finalBlockSize = 4
+		}
+	}
+	blockSize = finalBlockSize
+
+	finalHB := 30
+	if loadedCfg != nil && loadedCfg.HeartbeatInterval > 0 {
+		finalHB = loadedCfg.HeartbeatInterval
+	}
 
 	CurrentMode = *mode
 
@@ -205,23 +224,26 @@ func main() {
 	}
 
 	currentCfg = &Config{
-		CaptureX:  finalX,
-		CaptureY:  finalY,
-		Margin:    finalMargin,
-		UseMJPEG:  finalUseMJPEG,
-		UseNative: finalUseNative,
-		VCamName:  finalVCamName,
-		DebugURL:  finalDebugURL,
-		VCamPort:  finalVCamPort,
-		DebugX:    finalDebugX,
-		DebugY:    finalDebugY,
+		CaptureX:          finalX,
+		CaptureY:          finalY,
+		Margin:            finalMargin,
+		UseMJPEG:          finalUseMJPEG,
+		UseNative:         finalUseNative,
+		VCamName:          finalVCamName,
+		DebugURL:          finalDebugURL,
+		VCamPort:          finalVCamPort,
+		DebugX:            finalDebugX,
+		DebugY:            finalDebugY,
+		HeartbeatInterval: finalHB,
+		BlockSize:         finalBlockSize,
 	}
 
 	// Сохраняем конфиг, если он изменился или не существовал
 	if loadedCfg == nil || loadedCfg.CaptureX != finalX || loadedCfg.CaptureY != finalY ||
 		loadedCfg.Margin != finalMargin || loadedCfg.UseMJPEG != finalUseMJPEG || loadedCfg.UseNative != finalUseNative ||
 		loadedCfg.VCamName != finalVCamName || loadedCfg.DebugURL != finalDebugURL ||
-		loadedCfg.VCamPort != finalVCamPort || loadedCfg.DebugX != finalDebugX || loadedCfg.DebugY != finalDebugY {
+		loadedCfg.VCamPort != finalVCamPort || loadedCfg.DebugX != finalDebugX || loadedCfg.DebugY != finalDebugY ||
+		loadedCfg.HeartbeatInterval != finalHB || loadedCfg.BlockSize != finalBlockSize {
 		err := saveConfig(cfgFile, currentCfg)
 		if err != nil {
 			fmt.Printf("Warning: failed to save config: %v\n", err)

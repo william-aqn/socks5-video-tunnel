@@ -311,9 +311,11 @@ func runMJPEGClient() {
 
 			viewer.mu.Lock()
 			viewer.frameCount++
-			if viewer.frameCount%100 == 0 {
-				log.Printf("Viewer: Processed %d frames from MJPEG stream", viewer.frameCount)
-			}
+			/*
+				if viewer.frameCount%100 == 0 {
+					log.Printf("Viewer: Processed %d frames from MJPEG stream", viewer.frameCount)
+				}
+			*/
 			viewer.mu.Unlock()
 
 			rgba, ok := img.(*image.RGBA)

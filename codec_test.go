@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -31,6 +32,29 @@ func TestEncodeDecode(t *testing.T) {
 
 	if !bytes.Equal(data, decoded) {
 		t.Errorf("Decoded data does not match original. Got %s, want %s", string(decoded), string(data))
+	}
+}
+
+func TestEncodeDecodeFlexBlock(t *testing.T) {
+	sizes := []int{4, 6, 8, 12}
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("BlockSize-%d", size), func(t *testing.T) {
+			oldBlockSize := blockSize
+			blockSize = size
+			defer func() { blockSize = oldBlockSize }()
+
+			CurrentMode = "client"
+			data := []byte(fmt.Sprintf("Test message for block size %d. This should work correctly with flexible sizes.", size))
+			margin := 10
+			img := Encode(data, margin)
+
+			CurrentMode = "server"
+			decoded := Decode(img, margin)
+
+			if !bytes.Equal(data, decoded) {
+				t.Errorf("Decoded data does not match original for blockSize=%d. Got %q, want %q", size, string(decoded), string(data))
+			}
+		})
 	}
 }
 

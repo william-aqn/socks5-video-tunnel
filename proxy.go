@@ -1,19 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/png"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -44,7 +40,103 @@ var (
 	perfProcessSum time.Duration
 	lastFPS        float32
 	lastAvgMs      int
+)
 
+type PacketDispatcher struct {
+	mu           sync.RWMutex
+	connChannels map[uint16]chan []byte
+	heartbeatCh  chan []byte
+	connectCh    chan []byte
+}
+
+func NewPacketDispatcher() *PacketDispatcher {
+	return &PacketDispatcher{
+		connChannels: make(map[uint16]chan []byte),
+		heartbeatCh:  make(chan []byte, 32),
+		connectCh:    make(chan []byte, 32),
+	}
+}
+
+func (pd *PacketDispatcher) Register(id uint16) chan []byte {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	ch := make(chan []byte, 128)
+	pd.connChannels[id] = ch
+	return ch
+}
+
+func (pd *PacketDispatcher) Unregister(id uint16) {
+	pd.mu.Lock()
+	defer pd.mu.Unlock()
+	if ch, ok := pd.connChannels[id]; ok {
+		close(ch)
+		delete(pd.connChannels, id)
+	}
+}
+
+func (pd *PacketDispatcher) Dispatch(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	switch data[0] {
+	case typeHeartbeat:
+		select {
+		case pd.heartbeatCh <- data:
+		default:
+		}
+	case typeConnect:
+		select {
+		case pd.connectCh <- data:
+		default:
+		}
+	case typeData, typeConnAck:
+		if len(data) >= 3 {
+			id := uint16(data[1])<<8 | uint16(data[2])
+			pd.mu.RLock()
+			ch, ok := pd.connChannels[id]
+			pd.mu.RUnlock()
+			if ok {
+				select {
+				case ch <- data:
+				default:
+				}
+			} else {
+				// Пакет для неизвестного или уже закрытого соединения
+				if data[0] == typeData {
+					log.Printf("Dispatcher: Data for unknown connID %d (len: %d)", id, len(data))
+				}
+			}
+		}
+	default:
+		log.Printf("Dispatcher: Unknown packet type 0x%02x (len: %d)", data[0], len(data))
+	}
+}
+
+func (pd *PacketDispatcher) Run(video *ScreenVideoConn, margin int) {
+	for {
+		frameSize := captureWidth * captureHeight * 4
+		buf := make([]byte, frameSize)
+		startTime := time.Now()
+		_, err := io.ReadFull(video, buf)
+		if err != nil {
+			log.Printf("Dispatcher: screen read error: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		recordFrameProcess(time.Since(startTime))
+		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
+		data := Decode(img, margin)
+		if data != nil && len(data) > 0 {
+			recordRecvFrame()
+			UpdateCaptureStatus(true)
+			pd.Dispatch(data)
+		} else {
+			UpdateCaptureStatus(false)
+		}
+	}
+}
+
+var (
 	recvMu        sync.Mutex
 	recvFrames    int
 	recvLastCheck time.Time
@@ -179,21 +271,36 @@ func writeToVCam(img *image.RGBA) {
 	}
 }
 
-// runTunnelWithPrefix читает данные из dataConn, упаковывает их в видеокадры с префиксом типа и пишет в videoConn (VCam).
-// Также читает видеокадры из videoConn (Screen), распаковывает и пишет в dataConn.
-func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteCloser, margin int, connID uint16) {
+// runTunnelWithPrefix читает данные из dataConn, упаковывает их в видеокадры с префиксом типа и пишет в VCam.
+// Также получает пакеты из incoming канала и пишет в dataConn.
+func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, margin int, connID uint16, initialFPS int, incoming chan []byte) {
 	done := make(chan bool, 2)
-	start := time.Now()
 	var bytesSent, bytesReceived int64
 	var lastSentSeq, lastRevSeq byte
+	lastSentSeq = 0
+	lastRevSeq = 0
+	var lastDataAt = time.Now()
 
 	var mySID int64
-	if svc, ok := videoConn.(*ScreenVideoConn); ok {
-		mySID = svc.SessionID
+	if video != nil {
+		mySID = video.SessionID
 	}
 
 	// Настройка скорости
 	fpsIdx := 0
+	// Если передана начальная скорость, находим подходящий индекс
+	if initialFPS > 0 {
+		for i, f := range fpsLevels {
+			if f <= initialFPS {
+				fpsIdx = i
+			} else {
+				break
+			}
+		}
+	} else {
+		fpsIdx = 1
+	}
+
 	lastFPSIncrease := time.Now()
 	lastHeartbeat := time.Now()
 
@@ -204,24 +311,32 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 	}
 	ss := &speedState{}
 
-	// Принудительно ставим 2 FPS в начале (500ms)
-	if svc, ok := videoConn.(*ScreenVideoConn); ok {
-		svc.ReadDelay = 500 * time.Millisecond
-	}
-
 	go func() {
-		defer func() { done <- true }()
+		defer func() {
+			log.Printf("Tunnel: Exit Data->Video goroutine (ID: %d)", connID)
+			done <- true
+		}()
 		for {
 			fps := fpsLevels[fpsIdx]
 			sendInterval := time.Second / time.Duration(fps)
 			loopStart := time.Now()
 
-			// 1. Проверяем нужно ли отправить Heartbeat для согласования скорости
 			ss.mu.Lock()
 			remRecv := ss.remoteReceivedFPS
 			ss.mu.Unlock()
 
-			if time.Since(lastHeartbeat) > 2*time.Second || remRecv < fps {
+			hbInterval := 30 * time.Second
+			if currentCfg != nil && currentCfg.HeartbeatInterval > 0 {
+				hbInterval = time.Duration(currentCfg.HeartbeatInterval) * time.Second
+			}
+
+			needHB := time.Since(lastHeartbeat) > hbInterval
+			// Если удаленная сторона не успевает, посылаем Heartbeat чуть чаще для коррекции (но не чаще чем раз в 5 сек)
+			if !needHB && (remRecv < fps && remRecv > 0) && time.Since(lastHeartbeat) > 5*time.Second {
+				needHB = true
+			}
+
+			if needHB {
 				fpsMetrics, ms := getPerfMetrics()
 				hb := HeartbeatData{
 					FPS:          fpsMetrics,
@@ -237,22 +352,17 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 				writeToVCam(Encode(payload, margin))
 				lastHeartbeat = time.Now()
 
-				// Если удаленная сторона подтвердила наш уровень, пробуем расти
-				if remRecv >= fps && fpsIdx < len(fpsLevels)-1 && time.Since(lastFPSIncrease) > 3*time.Second {
+				if remRecv >= fps && fpsIdx < len(fpsLevels)-1 && time.Since(lastFPSIncrease) > 5*time.Second {
 					fpsIdx++
 					lastFPSIncrease = time.Now()
-					log.Printf("Tunnel: Ramping up to %d FPS (remote confirmed %d FPS)", fpsLevels[fpsIdx], fps)
-					// Увеличиваем частоту чтения тоже
-					if svc, ok := videoConn.(*ScreenVideoConn); ok {
-						svc.ReadDelay = time.Second / time.Duration(fpsLevels[fpsIdx]*2)
-						if svc.ReadDelay < 30*time.Millisecond {
-							svc.ReadDelay = 30 * time.Millisecond
-						}
-					}
+					log.Printf("Tunnel: Ramping up to %d FPS (remote confirmed %d FPS)", fpsLevels[fpsIdx], remRecv)
+				} else if remRecv < fps-2 && remRecv > 0 && fpsIdx > 0 && time.Since(lastFPSIncrease) > 5*time.Second {
+					fpsIdx--
+					lastFPSIncrease = time.Now()
+					log.Printf("Tunnel: Ramping down to %d FPS (remote confirmed only %d FPS)", fpsLevels[fpsIdx], remRecv)
 				}
 			}
 
-			// 2. Читаем данные из сокета
 			maxData := 490
 			buf := make([]byte, maxData)
 			if tc, ok := dataConn.(interface{ SetReadDeadline(time.Time) error }); ok {
@@ -261,7 +371,11 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 			n, err := dataConn.Read(buf)
 
 			if err == nil && n > 0 {
+				lastDataAt = time.Now()
 				lastSentSeq++
+				if lastSentSeq == 0 {
+					lastSentSeq = 1
+				}
 				payload := make([]byte, 4+n)
 				payload[0] = typeData
 				payload[1] = byte(connID >> 8)
@@ -270,98 +384,78 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 				copy(payload[4:], buf[:n])
 				img := Encode(payload, margin)
 				writeToVCam(img)
-				if _, err := videoConn.Write(img.Pix); err != nil {
-					return
-				}
 				bytesSent += int64(n)
-				if bytesSent%1000 < int64(n) || bytesSent < 1000 {
-					log.Printf("Tunnel: Sent %d bytes, current FPS: %d", bytesSent, fps)
-				}
+				// log.Printf("Tunnel: Sent pkt seq=%d, len=%d (total sent: %d)", lastSentSeq, n, bytesSent)
+				time.Sleep(sendInterval / 2)
 			} else if err != nil {
 				if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+					log.Printf("Tunnel: dataConn read error (ID: %d): %v", connID, err)
 					return
 				}
 			}
 
-			// 3. Соблюдаем FPS
 			elapsed := time.Since(loopStart)
 			if elapsed < sendInterval {
 				time.Sleep(sendInterval - elapsed)
+			}
+
+			if time.Since(lastDataAt) > 30*time.Second {
+				log.Printf("Tunnel: Inactive for 30s, closing (ID: %d)", connID)
+				return
 			}
 		}
 	}()
 
 	go func() {
-		defer func() { done <- true }()
+		defer func() {
+			log.Printf("Tunnel: Exit Video->Data goroutine (ID: %d)", connID)
+			done <- true
+		}()
 		var remoteSID int64
-		for {
-			frameSize := captureWidth * captureHeight * 4
-			buf := make([]byte, frameSize)
-			frameStart := time.Now()
-			if _, err := io.ReadFull(videoConn, buf); err != nil {
-				return
+		for data := range incoming {
+			if len(data) < 1 {
+				continue
 			}
-
-			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-			data := Decode(img, margin)
-			recordFrameProcess(time.Since(frameStart))
-
-			if data != nil && len(data) >= 1 {
-				recordRecvFrame()
-				UpdateCaptureStatus(true)
-				switch data[0] {
-				case typeData:
-					if len(data) < 4 {
-						continue
+			switch data[0] {
+			case typeData:
+				if len(data) < 4 {
+					continue
+				}
+				id := uint16(data[1])<<8 | uint16(data[2])
+				if id != connID {
+					continue
+				}
+				seq := data[3]
+				if seq != lastRevSeq {
+					lastDataAt = time.Now()
+					n, err := dataConn.Write(data[4:])
+					if err != nil {
+						log.Printf("Tunnel: dataConn write error (ID: %d): %v", connID, err)
+						return
 					}
-					id := uint16(data[1])<<8 | uint16(data[2])
-					if id != connID {
-						continue
+					bytesReceived += int64(n)
+					lastRevSeq = seq
+					// log.Printf("Tunnel: Received pkt seq=%d, len=%d (total recv: %d)", seq, n, bytesReceived)
+				}
+			case typeHeartbeat:
+				var hb HeartbeatData
+				if err := json.Unmarshal(data[1:], &hb); err == nil {
+					if remoteSID != 0 && hb.SessionID != remoteSID {
+						log.Printf("Tunnel: Remote session ID changed (%d -> %d), closing tunnel", remoteSID, hb.SessionID)
+						return
 					}
-					seq := data[3]
-					if seq != lastRevSeq {
-						n, err := dataConn.Write(data[4:])
-						if err != nil {
-							return
-						}
-						bytesReceived += int64(n)
-						lastRevSeq = seq
-						if bytesReceived%1000 < int64(n) || bytesReceived < 1000 {
-							log.Printf("Tunnel: Received %d bytes", bytesReceived)
-						}
-					}
-				case typeHeartbeat:
-					var hb HeartbeatData
-					if err := json.Unmarshal(data[1:], &hb); err == nil {
-						if remoteSID != 0 && hb.SessionID != remoteSID {
-							log.Printf("Tunnel: Remote session ID changed (%d -> %d), closing tunnel", remoteSID, hb.SessionID)
-							return
-						}
-						remoteSID = hb.SessionID
-
-						ss.mu.Lock()
-						if hb.TargetFPS > 0 {
-							if hb.TargetFPS != ss.lastRemoteFPS {
-								log.Printf("Tunnel: Remote is sending at %d FPS", hb.TargetFPS)
-							}
-							ss.lastRemoteFPS = hb.TargetFPS
-						}
-						if hb.ReceivedFPS > 0 {
-							if hb.ReceivedFPS != ss.remoteReceivedFPS {
-								log.Printf("Tunnel: Remote confirmed they receive %d FPS", hb.ReceivedFPS)
-							}
-							ss.remoteReceivedFPS = hb.ReceivedFPS
-						}
-						ss.mu.Unlock()
-					}
+					remoteSID = hb.SessionID
+					ss.mu.Lock()
+					ss.lastRemoteFPS = hb.TargetFPS
+					ss.remoteReceivedFPS = hb.ReceivedFPS
+					ss.mu.Unlock()
 				}
 			}
 		}
 	}()
 
 	<-done
-	duration := time.Since(start)
-	log.Printf("Tunnel: Closed. Duration: %v, Sent: %d bytes, Received: %d bytes", duration, bytesSent, bytesReceived)
+	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
 		writeToVCam(Encode(nil, margin))
@@ -382,130 +476,96 @@ func UpdateActiveCaptureArea(hwnd syscall.Handle, x, y int) {
 // RunScreenSocksServer работает через захват экрана и VCam с динамическим выбором цели
 func RunScreenSocksServer(x, y, margin int) {
 	log.Printf("Server: Watching screen at (%d, %d) with margin %d", x, y, margin)
-	// Уменьшаем начальную задержку до 100мс (10 FPS), чтобы быстрее реагировать на клиента
 	video := &ScreenVideoConn{X: x, Y: y, Margin: margin, ReadDelay: 100 * time.Millisecond, SessionID: rand.Int63()}
 
 	activeVideoMu.Lock()
 	activeVideoConn = video
 	activeVideoMu.Unlock()
 
-	frameCount := 0
-	var lastData []byte
+	pd := NewPacketDispatcher()
+	go pd.Run(video, margin)
+
 	var lastHeartbeatRecv time.Time
+	var lastLog time.Time
 	for {
-		loopStart := time.Now()
-		frameSize := captureWidth * captureHeight * 4
-		buf := make([]byte, frameSize)
-		_, err := io.ReadFull(video, buf)
-		if err != nil {
-			log.Printf("Server: screen read error: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
+		select {
+		case data := <-pd.heartbeatCh:
+			var hb HeartbeatData
+			if err := json.Unmarshal(data[1:], &hb); err == nil {
+				if time.Since(lastLog) > 5*time.Second {
+					log.Printf("Server: Remote quality: SID=%d, FPS=%.1f, TargetFPS=%d", hb.SessionID, hb.FPS, hb.TargetFPS)
+					lastLog = time.Now()
+				}
+				lastHeartbeatRecv = time.Now()
 
-		recordFrameProcess(time.Since(loopStart))
-		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
+				if hb.TargetFPS > 0 {
+					newDelay := time.Second / time.Duration(hb.TargetFPS*2)
+					if newDelay < 20*time.Millisecond {
+						newDelay = 20 * time.Millisecond
+					}
+					if video.ReadDelay != newDelay {
+						log.Printf("Server: Adapting capture delay to %v (Target FPS: %d)", newDelay, hb.TargetFPS)
+						video.ReadDelay = newDelay
+					}
+				}
 
-		if frameCount == 10 { // Сохраняем 10-й кадр для проверки
-			f, err := os.Create("debug_server_capture.png")
+				fps, ms := getPerfMetrics()
+				resp := HeartbeatData{
+					FPS:          fps,
+					ProcessingMS: ms,
+					Timestamp:    time.Now().Unix(),
+					TargetFPS:    int(1000 / video.ReadDelay.Milliseconds()),
+					ReceivedFPS:  getRecvFPS(),
+					Ready:        true,
+					SessionID:    video.SessionID,
+				}
+				hbBytes, _ := json.Marshal(resp)
+				writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
+			}
+
+		case data := <-pd.connectCh:
+			if len(data) < 3 {
+				continue
+			}
+			connID := uint16(data[1])<<8 | uint16(data[2])
+			targetAddr := string(data[3:])
+			targetAddr = strings.TrimRight(targetAddr, "\x00")
+			log.Printf("Server: Decoded CONNECT to %s (ID: %d)", targetAddr, connID)
+
+			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+			status := byte(0)
+			if err != nil {
+				log.Printf("Server: dial failed to %s: %v", targetAddr, err)
+				status = 1
+			}
+
+			payload := make([]byte, 4)
+			payload[0] = typeConnAck
+			payload[1] = byte(connID >> 8)
+			payload[2] = byte(connID)
+			payload[3] = status
+			writeToVCam(Encode(payload, margin))
+
 			if err == nil {
-				png.Encode(f, img)
-				f.Close()
-				log.Printf("Server: Saved debug_server_capture.png")
+				ch := pd.Register(connID)
+				go func() {
+					runTunnelWithPrefix(targetConn, video, margin, connID, 0, ch)
+					pd.Unregister(connID)
+					targetConn.Close()
+				}()
 			}
-		}
 
-		frameCount++
-		if frameCount%100 == 0 {
-			log.Printf("Server: Heartbeat - Processed %d frames from screen...", frameCount)
-		}
-
-		data := Decode(img, margin)
-		if data != nil {
-			recordRecvFrame()
-			UpdateCaptureStatus(true)
-			if !bytes.Equal(data, lastData) {
-				if len(data) >= 1 && data[0] == typeHeartbeat {
-					var hb HeartbeatData
-					if err := json.Unmarshal(data[1:], &hb); err == nil {
-						log.Printf("Server: Remote quality: SID=%d, FPS=%.1f, ProcMS=%d", hb.SessionID, hb.FPS, hb.ProcessingMS)
-						lastHeartbeatRecv = time.Now()
-
-						// Адаптируем частоту чтения под клиента (с запасом 2x)
-						if hb.TargetFPS > 0 {
-							newDelay := time.Second / time.Duration(hb.TargetFPS*2)
-							if newDelay < 20*time.Millisecond {
-								newDelay = 20 * time.Millisecond // Максимум 50 FPS захвата
-							}
-							if video.ReadDelay != newDelay {
-								log.Printf("Server: Adapting capture delay to %v (Target FPS: %d)", newDelay, hb.TargetFPS)
-								video.ReadDelay = newDelay
-							}
-						}
-
-						// Отвечаем на хартбит немедленно. Это обеспечивает актуальный ReceivedFPS для клиента
-						// во время калибровки и при этом не создает лишнего "шума" асинхронными кадрами.
-						fps, ms := getPerfMetrics()
-						resp := HeartbeatData{
-							FPS:          fps,
-							ProcessingMS: ms,
-							Timestamp:    time.Now().Unix(),
-							TargetFPS:    int(1000 / video.ReadDelay.Milliseconds()),
-							ReceivedFPS:  getRecvFPS(),
-							Ready:        true,
-							SessionID:    video.SessionID,
-						}
-						hbBytes, _ := json.Marshal(resp)
-						writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
-					}
-					lastData = data
-					continue
-				}
-
-				log.Printf("Server: Decoded %d bytes from screen", len(data))
-				lastData = data
-
-				if len(data) > 0 && data[0] == typeConnect {
-					if len(data) < 3 {
-						continue
-					}
-					connID := uint16(data[1])<<8 | uint16(data[2])
-					targetAddr := string(data[3:])
-					targetAddr = strings.TrimRight(targetAddr, "\x00")
-					log.Printf("Server: Request to %s (ID: %d, raw len: %d)", targetAddr, connID, len(data)-3)
-
-					targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
-					status := byte(0)
-					if err != nil {
-						log.Printf("Server: dial failed to %s: %v", targetAddr, err)
-						status = 1
-					}
-
-					// Отправляем ACK (несколько раз для надежности при низкой частоте кадров)
-					ackPayload := []byte{typeConnAck, byte(connID >> 8), byte(connID), status}
-					ackImg := Encode(ackPayload, margin)
-					for j := 0; j < 30; j++ {
-						writeToVCam(ackImg)
-						time.Sleep(100 * time.Millisecond)
-					}
-
-					if status == 0 {
-						log.Printf("Server: Tunnel established for %s (ID: %d)", targetAddr, connID)
-						runTunnelWithPrefix(targetConn, video, margin, connID)
-						targetConn.Close()
-						log.Println("Server: Connection closed, waiting for next...")
-						lastData = nil // Сбрасываем после туннеля
-					}
-				}
+		case <-time.After(5 * time.Second):
+			hbTimeout := 60 * time.Second
+			if currentCfg != nil && currentCfg.HeartbeatInterval > 0 {
+				hbTimeout = time.Duration(currentCfg.HeartbeatInterval) * 2 * time.Second
 			}
-		}
-
-		// Если давно нет хартбитов, замедляемся до 10 FPS
-		if !lastHeartbeatRecv.IsZero() && time.Since(lastHeartbeatRecv) > 5*time.Second {
-			if video.ReadDelay < 100*time.Millisecond {
-				video.ReadDelay = 100 * time.Millisecond
-				log.Println("Server: No heartbeats received, slowing down capture...")
-				lastHeartbeatRecv = time.Time{}
+			if !lastHeartbeatRecv.IsZero() && time.Since(lastHeartbeatRecv) > hbTimeout {
+				if video.ReadDelay < 100*time.Millisecond {
+					video.ReadDelay = 100 * time.Millisecond
+					log.Printf("Server: No heartbeats received for %v, slowing down capture...", hbTimeout)
+					lastHeartbeatRecv = time.Time{}
+				}
 			}
 		}
 	}
@@ -519,6 +579,9 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 	activeVideoConn = video
 	activeVideoMu.Unlock()
 
+	pd := NewPacketDispatcher()
+	go pd.Run(video, margin)
+
 	for {
 		log.Printf("Client: Starting handshake/calibration phase...")
 		bestFPS := 1
@@ -526,49 +589,42 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		// 1. Ждем хотя бы минимальной стабильности на 1 FPS
 		for {
 			log.Printf("Client: Testing base FPS level: 1...")
-			video.ReadDelay = 500 * time.Millisecond // Захват 2 FPS для теста 1 FPS
-			successCount := 0
-			lastSend := time.Time{}
-			sendInterval := 1000 * time.Millisecond
-			for i := 0; i < 10; i++ { // Больше итераций из-за 2x захвата
-				loopStart := time.Now()
-				if time.Since(lastSend) >= sendInterval {
-					fpsMetrics, ms := getPerfMetrics()
-					hb := HeartbeatData{
-						FPS:          fpsMetrics,
-						ProcessingMS: ms,
-						Timestamp:    time.Now().Unix(),
-						TargetFPS:    1,
-						ReceivedFPS:  getRecvFPS(),
-						Ready:        true,
-						SessionID:    video.SessionID,
-					}
-					hbBytes, _ := json.Marshal(hb)
-					writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
-					lastSend = time.Now()
-				}
+			video.ReadDelay = 500 * time.Millisecond
 
-				buf := make([]byte, captureWidth*captureHeight*4)
-				if _, err := io.ReadFull(video, buf); err == nil {
-					recordFrameProcess(time.Since(loopStart))
-					img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-					data := Decode(img, margin)
-					if data != nil && len(data) > 0 {
-						recordRecvFrame()
-						if data[0] == typeHeartbeat {
-							var remoteHb HeartbeatData
-							if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
-								successCount++
-							}
-						}
+			fpsMetrics, ms := getPerfMetrics()
+			hb := HeartbeatData{
+				FPS:          fpsMetrics,
+				ProcessingMS: ms,
+				Timestamp:    time.Now().Unix(),
+				TargetFPS:    1,
+				ReceivedFPS:  getRecvFPS(),
+				Ready:        true,
+				SessionID:    video.SessionID,
+			}
+			hbBytes, _ := json.Marshal(hb)
+			writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
+
+			timer := time.After(2 * time.Second)
+			connected := false
+		CalibrationLoop1:
+			for {
+				select {
+				case data := <-pd.heartbeatCh:
+					var remoteHb HeartbeatData
+					if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
+						connected = true
+						break CalibrationLoop1
 					}
+				case <-timer:
+					break CalibrationLoop1
 				}
 			}
-			if successCount >= 3 {
+
+			if connected {
 				log.Printf("Client: Connection established at 1 FPS")
 				break
 			}
-			log.Printf("Client: Server not responding or connection unstable, retrying...")
+			log.Printf("Client: Server not responding, retrying...")
 			time.Sleep(1 * time.Second)
 		}
 
@@ -580,81 +636,74 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			log.Printf("Client: Testing FPS level: %d...", testFPS)
 			video.ReadDelay = time.Duration(1000/(testFPS*2)) * time.Millisecond
 
-			successCount := 0
-			lastSend := time.Time{}
-			sendInterval := time.Duration(1000/testFPS) * time.Millisecond
-			for i := 0; i < 20; i++ { // Больше итераций из-за 2x захвата
-				loopStart := time.Now()
-				if time.Since(lastSend) >= sendInterval {
-					fpsMetrics, ms := getPerfMetrics()
-					hb := HeartbeatData{
-						FPS:          fpsMetrics,
-						ProcessingMS: ms,
-						Timestamp:    time.Now().Unix(),
-						TargetFPS:    testFPS,
-						ReceivedFPS:  getRecvFPS(),
-						Ready:        true,
-						SessionID:    video.SessionID,
-					}
-					hbBytes, _ := json.Marshal(hb)
-					writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
-					lastSend = time.Now()
-				}
+			success := false
+			fpsMetrics, ms := getPerfMetrics()
+			hb := HeartbeatData{
+				FPS:          fpsMetrics,
+				ProcessingMS: ms,
+				Timestamp:    time.Now().Unix(),
+				TargetFPS:    testFPS,
+				ReceivedFPS:  getRecvFPS(),
+				Ready:        true,
+				SessionID:    video.SessionID,
+			}
+			hbBytes, _ := json.Marshal(hb)
+			writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin))
 
-				buf := make([]byte, captureWidth*captureHeight*4)
-				if _, err := io.ReadFull(video, buf); err == nil {
-					recordFrameProcess(time.Since(loopStart))
-					img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-					if data := Decode(img, margin); data != nil && len(data) > 0 {
-						recordRecvFrame()
-						if data[0] == typeHeartbeat {
-							var remoteHb HeartbeatData
-							if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
-								if remoteHb.ReceivedFPS >= testFPS-2 && remoteHb.ReceivedFPS > 0 {
-									successCount++
-								}
-							}
+			timer := time.After(2 * time.Second)
+		CalibrationLoop2:
+			for {
+				select {
+				case data := <-pd.heartbeatCh:
+					var remoteHb HeartbeatData
+					if err := json.Unmarshal(data[1:], &remoteHb); err == nil && remoteHb.Ready {
+						if remoteHb.ReceivedFPS >= testFPS-2 && remoteHb.ReceivedFPS > 0 {
+							success = true
+							break CalibrationLoop2
 						}
 					}
+				case <-timer:
+					break CalibrationLoop2
 				}
 			}
 
-			if successCount >= 8 {
-				log.Printf("Client: FPS level %d is stable (%d/20)", testFPS, successCount)
+			if success {
+				log.Printf("Client: FPS level %d is stable", testFPS)
 				bestFPS = testFPS
 			} else {
-				log.Printf("Client: FPS level %d is NOT stable (%d/20), stopping calibration", testFPS, successCount)
+				log.Printf("Client: FPS level %d failed, staying at %d", testFPS, bestFPS)
 				break
 			}
 		}
 
-		video.ReadDelay = time.Duration(1000/bestFPS) * time.Millisecond
-		log.Printf("Client: Calibration finished. Optimal FPS: %d", bestFPS)
+		log.Printf("Client: Calibration finished. Best FPS: %d", bestFPS)
+		video.ReadDelay = time.Duration(1000/(bestFPS*2)) * time.Millisecond
 
 		ln, err := net.Listen("tcp", localListenAddr)
 		if err != nil {
-			log.Printf("Client: failed to listen on %s: %v, retrying in 5s...", localListenAddr, err)
-			time.Sleep(5 * time.Second)
-			continue
+			log.Printf("Client: Failed to listen on %s: %v", localListenAddr, err)
+			return
 		}
-		log.Printf("Client: Listening (SOCKS5) on %s, watching screen at (%d, %d) with margin %d", localListenAddr, x, y, margin)
+		log.Printf("Client: SOCKS5 server listening on %s", localListenAddr)
 
 		stopSession := make(chan struct{})
-		var tunnelActive atomic.Bool
-
-		// Фоновые хартбиты
 		go func() {
+			hbInterval := 30 * time.Second
+			if currentCfg != nil && currentCfg.HeartbeatInterval > 0 {
+				hbInterval = time.Duration(currentCfg.HeartbeatInterval) * time.Second
+			}
+			ticker := time.NewTicker(hbInterval)
+			defer ticker.Stop()
 			for {
 				select {
 				case <-stopSession:
 					return
-				case <-time.After(5 * time.Second):
-					if tunnelActive.Load() {
-						continue
-					}
-					fps, ms := getPerfMetrics()
+				case <-pd.heartbeatCh:
+					// Just consume
+				case <-ticker.C:
+					fpsMetrics, ms := getPerfMetrics()
 					hb := HeartbeatData{
-						FPS:          fps,
+						FPS:          fpsMetrics,
 						ProcessingMS: ms,
 						Timestamp:    time.Now().Unix(),
 						TargetFPS:    bestFPS,
@@ -668,100 +717,48 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			}
 		}()
 
-		// Мониторинг SID сервера
-		go func() {
-			var lastRemoteSID int64
-			for {
-				select {
-				case <-stopSession:
-					return
-				case <-time.After(2 * time.Second):
-					if tunnelActive.Load() {
-						continue
-					}
-					buf := make([]byte, captureWidth*captureHeight*4)
-					if _, err := io.ReadFull(video, buf); err == nil {
-						img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-						if data := Decode(img, margin); data != nil && len(data) > 0 {
-							if data[0] == typeHeartbeat {
-								var remoteHb HeartbeatData
-								if err := json.Unmarshal(data[1:], &remoteHb); err == nil {
-									if lastRemoteSID != 0 && remoteHb.SessionID != lastRemoteSID {
-										log.Printf("Client: Server session changed (%d -> %d), re-calibrating...", lastRemoteSID, remoteHb.SessionID)
-										ln.Close()
-										return
-									}
-									lastRemoteSID = remoteHb.SessionID
-								}
-							}
-						}
-					}
-				}
-			}
-		}()
-
-		// Accept loop
-		shouldRestart := false
 		for {
 			localConn, err := ln.Accept()
 			if err != nil {
-				log.Printf("Client: Accept error (closing listener): %v", err)
-				shouldRestart = true
 				break
 			}
-			log.Printf("Client: Accepted local connection from %s", localConn.RemoteAddr())
 
 			targetAddr, err := HandleSocksHandshake(localConn)
 			if err != nil {
-				log.Printf("Client: handshake error: %v", err)
+				log.Printf("Client: SOCKS5 handshake failed: %v", err)
 				localConn.Close()
 				continue
 			}
 
-			// 1. Отправляем CONNECT
 			connID := uint16(rand.Intn(65535) + 1)
-			log.Printf("Client: Sending CONNECT to %s (ID: %d)", targetAddr, connID)
+			log.Printf("Client: New connection to %s (ID: %d)", targetAddr, connID)
+
 			payload := make([]byte, 3+len(targetAddr))
 			payload[0] = typeConnect
 			payload[1] = byte(connID >> 8)
 			payload[2] = byte(connID)
 			copy(payload[3:], targetAddr)
-			connectImg := Encode(payload, margin)
-			for j := 0; j < 30; j++ {
-				writeToVCam(connectImg)
-				time.Sleep(100 * time.Millisecond)
-			}
+			writeToVCam(Encode(payload, margin))
 
-			// 2. Ждем ACK
-			log.Printf("Client: Waiting for ACK for %s (ID: %d)", targetAddr, connID)
+			ch := pd.Register(connID)
 			success := false
-			for i := 0; i < 40; i++ {
-				loopStart := time.Now()
-				frameSize := captureWidth * captureHeight * 4
-				buf := make([]byte, frameSize)
-				if _, err := io.ReadFull(video, buf); err != nil {
-					break
-				}
-				recordFrameProcess(time.Since(loopStart))
-				img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-				ackData := Decode(img, margin)
-				if ackData != nil && len(ackData) > 0 {
-					recordRecvFrame()
-					if ackData[0] == typeConnAck && len(ackData) >= 4 {
-						id := uint16(ackData[1])<<8 | uint16(ackData[2])
-						if id == connID {
-							UpdateCaptureStatus(true)
-							if ackData[3] == 0 {
-								success = true
-							}
-							break
-						}
+			timer := time.After(5 * time.Second)
+		WaitAck:
+			for {
+				select {
+				case data := <-ch:
+					if data[0] == typeConnAck && len(data) >= 4 {
+						success = (data[3] == 0)
+						break WaitAck
 					}
+				case <-timer:
+					break WaitAck
 				}
 			}
 
 			if !success {
 				log.Printf("Client: Failed to establish tunnel to %s (ID: %d)", targetAddr, connID)
+				pd.Unregister(connID)
 				_ = SendSocksResponse(localConn, fmt.Errorf("failed"))
 				localConn.Close()
 				continue
@@ -769,20 +766,15 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 
 			_ = SendSocksResponse(localConn, nil)
 			log.Printf("Client: Tunnel established to %s (ID: %d)", targetAddr, connID)
-			time.Sleep(2 * time.Second)
-			tunnelActive.Store(true)
-			runTunnelWithPrefix(localConn, video, margin, connID)
-			tunnelActive.Store(false)
-			localConn.Close()
-			log.Println("Client: Tunnel finished")
-		}
 
-		close(stopSession)
-		if !shouldRestart {
-			// If we broke out of loop not because of error, maybe we should stop?
-			// But for now always restart.
+			go func() {
+				runTunnelWithPrefix(localConn, video, margin, connID, bestFPS, ch)
+				pd.Unregister(connID)
+				localConn.Close()
+			}()
 		}
-		log.Printf("Client: Restarting calibration...")
+		close(stopSession)
+		ln.Close()
 		time.Sleep(1 * time.Second)
 	}
 }
