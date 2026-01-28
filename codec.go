@@ -13,7 +13,95 @@ const (
 	blockSize     = 8
 	captureWidth  = 1024
 	captureHeight = 1024
+	markerSize    = 8
+	markerOffset  = 4
 )
+
+type ColorRange struct {
+	rMin, rMax, gMin, gMax, bMin, bMax int
+}
+
+type MarkerRanges struct {
+	TL, TR, BL, BR ColorRange
+}
+
+type MarkerColors struct {
+	TL, TR, BL, BR color.RGBA
+}
+
+var (
+	ClientMarkers = MarkerColors{
+		TL: color.RGBA{255, 0, 0, 255},     // Red
+		TR: color.RGBA{0, 255, 0, 255},     // Green
+		BL: color.RGBA{0, 0, 255, 255},     // Blue
+		BR: color.RGBA{255, 255, 255, 255}, // White
+	}
+	ServerMarkers = MarkerColors{
+		TL: color.RGBA{255, 255, 0, 255}, // Yellow
+		TR: color.RGBA{255, 0, 255, 255}, // Magenta
+		BL: color.RGBA{0, 255, 255, 255}, // Cyan
+		BR: color.RGBA{255, 165, 0, 255}, // Orange
+	}
+)
+
+var (
+	ClientRanges = MarkerRanges{
+		TL: ColorRange{200, 255, 0, 100, 0, 100},     // Red
+		TR: ColorRange{0, 100, 200, 255, 0, 100},     // Green
+		BL: ColorRange{0, 100, 0, 100, 200, 255},     // Blue
+		BR: ColorRange{200, 255, 200, 255, 200, 255}, // White
+	}
+	ServerRanges = MarkerRanges{
+		TL: ColorRange{200, 255, 200, 255, 0, 100}, // Yellow
+		TR: ColorRange{200, 255, 0, 100, 200, 255}, // Magenta
+		BL: ColorRange{0, 100, 200, 255, 200, 255}, // Cyan
+		BR: ColorRange{200, 255, 120, 210, 0, 100}, // Orange
+	}
+)
+
+var CurrentMode string // "client" or "server"
+
+func matchRange(r, g, b uint8, cr ColorRange) bool {
+	return int(r) >= cr.rMin && int(r) <= cr.rMax &&
+		int(g) >= cr.gMin && int(g) <= cr.gMax &&
+		int(b) >= cr.bMin && int(b) <= cr.bMax
+}
+
+// FindMarkers ищет контрольные точки в изображении и возвращает координаты левого верхнего угла области захвата
+func FindMarkers(img *image.RGBA, mode string) (int, int, bool) {
+	var ranges MarkerRanges
+	if mode == "server" {
+		ranges = ClientRanges
+	} else {
+		ranges = ServerRanges
+	}
+
+	distX := width - markerSize - 2*markerOffset
+	distY := height - markerSize - 2*markerOffset
+
+	// Сканируем изображение в поисках TL маркера
+	// Используем шаг 2 для надежности при поиске маленького маркера (8x8)
+	for y := 0; y < img.Rect.Dy()-height+markerSize; y += 2 {
+		for x := 0; x < img.Rect.Dx()-width+markerSize; x += 2 {
+			c := img.RGBAAt(x, y)
+			if matchRange(c.R, c.G, c.B, ranges.TL) {
+				// Проверяем остальные маркеры на ожидаемых расстояниях
+				if x+distX+markerSize < img.Rect.Dx() && y+distY+markerSize < img.Rect.Dy() {
+					cTR := img.RGBAAt(x+distX, y)
+					cBL := img.RGBAAt(x, y+distY)
+					cBR := img.RGBAAt(x+distX, y+distY)
+
+					if matchRange(cTR.R, cTR.G, cTR.B, ranges.TR) &&
+						matchRange(cBL.R, cBL.G, cBL.B, ranges.BL) &&
+						matchRange(cBR.R, cBR.G, cBR.B, ranges.BR) {
+						return x - markerOffset, y - markerOffset, true
+					}
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
 
 // Encode записывает данные в пиксели изображения.
 // Используем 1 бит на блок blockSize x blockSize пикселей для максимальной надежности.
@@ -28,10 +116,10 @@ func Encode(data []byte, margin int) *image.RGBA {
 		img.Pix[i+3] = 255
 	}
 
-	// Рисуем контрольные точки в углах (8x8 пикселя)
+	// Рисуем контрольные точки в углах (8x8 пикселя) с отступом
 	drawMarker := func(x, y int, c color.RGBA) {
-		for dy := 0; dy < 8; dy++ {
-			for dx := 0; dx < 8; dx++ {
+		for dy := 0; dy < markerSize; dy++ {
+			for dx := 0; dx < markerSize; dx++ {
 				if x+dx < width && y+dy < height {
 					img.SetRGBA(x+dx, y+dy, c)
 				}
@@ -39,10 +127,15 @@ func Encode(data []byte, margin int) *image.RGBA {
 		}
 	}
 
-	drawMarker(0, 0, color.RGBA{255, 0, 0, 255})                  // Красный - левый верхний
-	drawMarker(width-8, 0, color.RGBA{0, 255, 0, 255})            // Зеленый - правый верхний
-	drawMarker(0, height-8, color.RGBA{0, 0, 255, 255})           // Синий - левый нижний
-	drawMarker(width-8, height-8, color.RGBA{255, 255, 255, 255}) // Белый - правый нижний
+	markers := ClientMarkers
+	if CurrentMode == "server" {
+		markers = ServerMarkers
+	}
+
+	drawMarker(markerOffset, markerOffset, markers.TL)
+	drawMarker(width-markerSize-markerOffset, markerOffset, markers.TR)
+	drawMarker(markerOffset, height-markerSize-markerOffset, markers.BL)
+	drawMarker(width-markerSize-markerOffset, height-markerSize-markerOffset, markers.BR)
 
 	// Длина данных (2 байта достаточно для такого метода, макс ~2400 байт)
 	dataLen := len(data)
@@ -98,7 +191,7 @@ Done:
 // Decode извлекает данные из изображения.
 func Decode(img *image.RGBA, margin int) []byte {
 	// Ищем центры 4-х угловых маркеров
-	findCenter := func(rMin, rMax, gMin, gMax, bMin, bMax int, sx, sy, sw, sh int) (float64, float64, bool) {
+	findCenter := func(cr ColorRange, sx, sy, sw, sh int) (float64, float64, bool) {
 		var sumX, sumY float64
 		var count float64
 		for y := sy; y < sy+sh; y++ {
@@ -107,9 +200,9 @@ func Decode(img *image.RGBA, margin int) []byte {
 					continue
 				}
 				c := img.RGBAAt(x, y)
-				if int(c.R) >= rMin && int(c.R) <= rMax &&
-					int(c.G) >= gMin && int(c.G) <= gMax &&
-					int(c.B) >= bMin && int(c.B) <= bMax {
+				if int(c.R) >= cr.rMin && int(c.R) <= cr.rMax &&
+					int(c.G) >= cr.gMin && int(c.G) <= cr.gMax &&
+					int(c.B) >= cr.bMin && int(c.B) <= cr.bMax {
 					sumX += float64(x)
 					sumY += float64(y)
 					count++
@@ -122,37 +215,50 @@ func Decode(img *image.RGBA, margin int) []byte {
 		return sumX / count, sumY / count, true
 	}
 
-	// Красный (левый верхний)
-	rx, ry, okR := findCenter(200, 255, 0, 100, 0, 100, 0, 0, 100, 100)
+	ranges := ServerRanges
+	if CurrentMode == "server" {
+		ranges = ClientRanges
+	}
+
+	// TL (левый верхний)
+	rx, ry, okR := findCenter(ranges.TL, 0, 0, 150, 150)
 	if !okR {
+		// log.Printf("Codec: TL marker not found")
 		return nil
 	}
 
-	// Зеленый (правый верхний) - ищем в правой половине
-	gx, gy, okG := findCenter(0, 100, 200, 255, 0, 100, 300, 0, img.Bounds().Dx()-300, 100)
-	// Синий (левый нижний) - ищем в нижней половине
-	bx, by, okB := findCenter(0, 100, 0, 100, 200, 255, 0, 300, 100, img.Bounds().Dy()-300)
-	// Белый (правый нижний) - ищем в правой нижней четверти
-	wx, wy, okW := findCenter(200, 255, 200, 255, 200, 255, 300, 300, img.Bounds().Dx()-300, img.Bounds().Dy()-300)
+	// TR (правый верхний) - ищем в правой половине
+	gx, _, okG := findCenter(ranges.TR, 300, 0, img.Bounds().Dx()-300, 150)
+	if !okG {
+		// log.Printf("Codec: TR marker not found")
+	}
+
+	// BL (левый нижний) - ищем в нижней половине
+	_, by, okB := findCenter(ranges.BL, 0, 300, 150, img.Bounds().Dy()-300)
+	if !okB {
+		// log.Printf("Codec: BL marker not found")
+	}
+
+	// BR (правый нижний) - ищем в правой нижней четверти
+	_, _, okW := findCenter(ranges.BR, 300, 300, img.Bounds().Dx()-300, img.Bounds().Dy()-300)
+	if !okW {
+		// log.Printf("Codec: BR marker not found")
+	}
 
 	scaleX := 1.0
 	scaleY := 1.0
 	if okG {
-		scaleX = (gx - rx) / 632.0 // 632 = width - 8
+		scaleX = (gx - rx) / 624.0 // width - markerSize - 2*markerOffset
 	}
 	if okB {
-		scaleY = (by - ry) / 472.0 // 472 = height - 8
+		scaleY = (by - ry) / 464.0 // height - markerSize - 2*markerOffset
 	}
 
-	offsetX := rx - 4.0*scaleX
-	offsetY := ry - 4.0*scaleY
+	offsetX := rx - 8.0*scaleX // markerOffset + markerSize/2
+	offsetY := ry - 8.0*scaleY
 
 	if okG && okB && okW {
-		log.Printf("Codec: Calibration: ScaleX=%.3f, ScaleY=%.3f, Offset=(%.1f, %.1f)", scaleX, scaleY, offsetX, offsetY)
-		_ = wx
-		_ = wy
-		_ = gy
-		_ = bx
+		// log.Printf("Codec: Calibration: ScaleX=%.3f, ScaleY=%.3f, Offset=(%.1f, %.1f)", scaleX, scaleY, offsetX, offsetY)
 	}
 
 	var bits []bool
@@ -163,17 +269,27 @@ func Decode(img *image.RGBA, margin int) []byte {
 				continue
 			}
 
-			// Сэмплируем центр блока с учетом смещения и масштаба
-			px := int(offsetX + float64(x)*scaleX + float64(blockSize)/2.0*scaleX)
-			py := int(offsetY + float64(y)*scaleY + float64(blockSize)/2.0*scaleY)
+			// Сэмплируем блок 3x3 в центре для устойчивости к шуму
+			var sumBrightness uint32
+			points := 0
+			for dy := -1; dy <= 1; dy++ {
+				for dx := -1; dx <= 1; dx++ {
+					px := int(offsetX + (float64(x)+float64(blockSize)/2.0+float64(dx))*scaleX)
+					py := int(offsetY + (float64(y)+float64(blockSize)/2.0+float64(dy))*scaleY)
 
-			if px < 0 || px >= img.Bounds().Dx() || py < 0 || py >= img.Bounds().Dy() {
-				continue
+					if px >= 0 && px < img.Bounds().Dx() && py >= 0 && py < img.Bounds().Dy() {
+						c := img.RGBAAt(px, py)
+						sumBrightness += (uint32(c.R) + uint32(c.G) + uint32(c.B)) / 3
+						points++
+					}
+				}
 			}
 
-			c := img.RGBAAt(px, py)
-			brightness := (uint32(c.R) + uint32(c.G) + uint32(c.B)) / 3
-			bits = append(bits, brightness > 128)
+			if points > 0 {
+				bits = append(bits, (sumBrightness/uint32(points)) > 128)
+			} else {
+				bits = append(bits, false)
+			}
 		}
 	}
 
@@ -199,16 +315,16 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 	dataLen := int(fullData[0])<<8 | int(fullData[1])
 	if dataLen <= 0 || dataLen > 2000 {
-		if dataLen != 0 {
-			log.Printf("Codec: dataLen %d out of range (first bits: %08b %08b)", dataLen, fullData[0], fullData[1])
+		if dataLen != 0 && dataLen < 5000 {
+			log.Printf("Codec: potential data detected but dataLen %d invalid. First bytes: %02x %02x", dataLen, fullData[0], fullData[1])
 		}
 		return nil
 	}
 	if dataLen > len(fullData)-2 {
-		log.Printf("Codec: dataLen %d > available %d", dataLen, len(fullData)-2)
+		// log.Printf("Codec: dataLen %d > available %d", dataLen, len(fullData)-2)
 		return nil
 	}
 
-	log.Printf("Codec: Successfully decoded %d bytes", dataLen)
+	log.Printf("Codec: Successfully decoded %d bytes: %v", dataLen, fullData[2:2+dataLen])
 	return fullData[2 : 2+dataLen]
 }

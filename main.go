@@ -181,20 +181,27 @@ func main() {
 		}
 	}
 
-	if *useUI || (finalX == -1 && finalY == -1) {
+	CurrentMode = *mode
+
+	if *useUI {
 		fmt.Println("Please select capture area using the window...")
 		x, y, err := SelectCaptureArea()
 		if err != nil {
 			fmt.Printf("UI Selection failed: %v\n", err)
 			if finalX == -1 || finalY == -1 {
-				fmt.Println("Please provide coordinates via flags: -capture-x and -capture-y")
-				os.Exit(1)
+				fmt.Println("No coordinates provided, using (0,0) as default.")
+				finalX, finalY = 0, 0
+			} else {
+				fmt.Println("Using existing coordinates.")
 			}
-			fmt.Println("Using existing coordinates.")
 		} else {
 			finalX, finalY = x, y
 			fmt.Printf("Selected area: (%d, %d)\n", finalX, finalY)
 		}
+	} else if finalX == -1 && finalY == -1 {
+		// Default to 0,0 if nothing specified and UI not requested
+		finalX, finalY = 0, 0
+		fmt.Println("Using default coordinates (0, 0). Use Hotkey or -ui to change.")
 	}
 
 	currentCfg = &Config{
@@ -224,20 +231,42 @@ func main() {
 	}
 
 	// Запускаем обработчик горячих клавиш
-	StartHotkeyHandler(*mode, func() {
-		fmt.Println("\nHotkey pressed! Changing capture area...")
-		x, y, err := SelectCaptureArea()
-		if err != nil {
-			fmt.Printf("Selection failed: %v\n", err)
-			return
-		}
-		fmt.Printf("New area selected: (%d, %d)\n", x, y)
-		UpdateActiveCaptureArea(x, y)
+	StartHotkeyHandler(*mode, func(id int) {
+		if id == HK_SELECT {
+			fmt.Println("\nHotkey pressed! Changing capture area...")
+			x, y, err := SelectCaptureArea()
+			if err != nil {
+				fmt.Printf("Selection failed: %v\n", err)
+				return
+			}
+			fmt.Printf("New area selected: (%d, %d)\n", x, y)
+			UpdateActiveCaptureArea(x, y)
 
-		currentCfg.CaptureX = x
-		currentCfg.CaptureY = y
-		saveConfig(cfgFile, currentCfg)
-		fmt.Printf("Coordinates updated and saved to %s\n", cfgFile)
+			currentCfg.CaptureX = x
+			currentCfg.CaptureY = y
+			saveConfig(cfgFile, currentCfg)
+			fmt.Printf("Coordinates updated and saved to %s\n", cfgFile)
+		} else {
+			// Тонкая настройка стрелками
+			newX, newY := currentCfg.CaptureX, currentCfg.CaptureY
+			switch id {
+			case HK_LEFT:
+				newX--
+			case HK_RIGHT:
+				newX++
+			case HK_UP:
+				newY--
+			case HK_DOWN:
+				newY++
+			}
+
+			if newX != currentCfg.CaptureX || newY != currentCfg.CaptureY {
+				currentCfg.CaptureX = newX
+				currentCfg.CaptureY = newY
+				UpdateActiveCaptureArea(newX, newY)
+				saveConfig(cfgFile, currentCfg)
+			}
+		}
 	})
 
 	// Инициализируем виртуальную камеру, она нужна в обоих режимах
@@ -252,6 +281,8 @@ func main() {
 		defer cam.Close()
 	}
 
+	ShowCaptureOverlay(*mode, finalX, finalY)
+
 	if *debugUI {
 		localURL := ""
 		if vcam != nil {
@@ -263,30 +294,55 @@ func main() {
 		})
 	}
 
+	targetPrefix := ""
 	if *mode == "server" {
-		targetPrefix := "VideoGo Debug Viewer [client]"
-		log.Printf("Server: Searching for client window '%s'...", targetPrefix)
-		for i := 0; i < 30; i++ {
-			x, y, err := FindCaptureWindow(targetPrefix)
-			if err == nil {
-				log.Printf("Server: Found client window at (%d, %d)", x, y)
-				finalX, finalY = x, y
-				break
-			}
-			time.Sleep(time.Second)
-		}
+		targetPrefix = "[VGO-CLIENT]"
 	} else if *mode == "client" {
-		targetPrefix := "VideoGo Debug Viewer [server]"
-		log.Printf("Client: Searching for server window '%s'...", targetPrefix)
-		for i := 0; i < 30; i++ {
-			x, y, err := FindCaptureWindow(targetPrefix)
-			if err == nil {
-				log.Printf("Client: Found server window at (%d, %d)", x, y)
-				finalX, finalY = x, y
-				break
+		targetPrefix = "[VGO-SERVER]"
+	}
+
+	if targetPrefix != "" {
+		go func() {
+			log.Printf("%s: Starting continuous tracking for '%s'...", *mode, targetPrefix)
+			for {
+				// 1. Сначала пробуем найти окно по заголовку
+				x, y, err := FindCaptureWindow(targetPrefix)
+				if err == nil {
+					if x != currentCfg.CaptureX || y != currentCfg.CaptureY {
+						log.Printf("%s: Window found/moved to (%d, %d), updating...", *mode, x, y)
+						currentCfg.CaptureX = x
+						currentCfg.CaptureY = y
+						UpdateActiveCaptureArea(x, y)
+						saveConfig(cfgFile, currentCfg)
+					}
+				} else {
+					// 2. Если окно не найдено, пробуем найти маркеры в текущей области
+					activeVideoMu.RLock()
+					conn := activeVideoConn
+					activeVideoMu.RUnlock()
+
+					if conn != nil {
+						// Захватываем чуть больше (1024x1024), чтобы найти маркеры, даже если они уехали
+						img, err := CaptureScreen(conn.X, conn.Y, captureWidth, captureHeight)
+						if err == nil {
+							dx, dy, found := FindMarkers(img, *mode)
+							if found && (dx != 0 || dy != 0) {
+								newX := conn.X + dx
+								newY := conn.Y + dy
+								if newX != currentCfg.CaptureX || newY != currentCfg.CaptureY {
+									log.Printf("%s: Markers detected at shift (%d, %d). Adjusting to (%d, %d)", *mode, dx, dy, newX, newY)
+									currentCfg.CaptureX = newX
+									currentCfg.CaptureY = newY
+									UpdateActiveCaptureArea(newX, newY)
+									saveConfig(cfgFile, currentCfg)
+								}
+							}
+						}
+					}
+				}
+				time.Sleep(2 * time.Second)
 			}
-			time.Sleep(time.Second)
-		}
+		}()
 	}
 
 	switch *mode {

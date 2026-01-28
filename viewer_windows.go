@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -117,9 +118,9 @@ func StartDebugUI(mode, initialURL, localURL string, x, y int, onURLChange func(
 	viewer.onURLChange = onURLChange
 
 	className, _ := syscall.UTF16PtrFromString("VideoGoViewerClass")
-	title := fmt.Sprintf("VideoGo Debug Viewer [%s]", mode)
+	title := fmt.Sprintf("[VGO-%s] VideoGo Debug Viewer", strings.ToUpper(mode))
 	if localURL != "" {
-		title = fmt.Sprintf("VideoGo Debug Viewer [%s] (My MJPEG: %s)", mode, localURL)
+		title = fmt.Sprintf("[VGO-%s] VideoGo Debug Viewer (My MJPEG: %s)", strings.ToUpper(mode), localURL)
 	}
 	windowName, _ := syscall.UTF16PtrFromString(title)
 

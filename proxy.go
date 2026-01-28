@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/png"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -100,6 +102,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 				return
 			}
 			bytesSent += int64(n)
+			if bytesSent%1000 < int64(n) {
+				log.Printf("Tunnel: Sent %d bytes so far", bytesSent)
+			}
 		}
 	}()
 
@@ -120,6 +125,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, videoConn io.ReadWriteClos
 					return
 				}
 				bytesReceived += int64(n)
+				if bytesReceived%1000 < int64(n) {
+					log.Printf("Tunnel: Received %d bytes so far", bytesReceived)
+				}
 			}
 		}
 	}()
@@ -136,6 +144,7 @@ func UpdateActiveCaptureArea(x, y int) {
 		activeVideoConn.X = x
 		activeVideoConn.Y = y
 	}
+	UpdateCaptureOverlay(x, y)
 }
 
 // RunScreenSocksServer работает через захват экрана и VCam с динамическим выбором цели
@@ -158,12 +167,22 @@ func RunScreenSocksServer(x, y, margin int) {
 			continue
 		}
 
+		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
+
+		if frameCount == 10 { // Сохраняем 10-й кадр для проверки
+			f, err := os.Create("debug_server_capture.png")
+			if err == nil {
+				png.Encode(f, img)
+				f.Close()
+				log.Printf("Server: Saved debug_server_capture.png")
+			}
+		}
+
 		frameCount++
 		if frameCount%100 == 0 {
 			log.Printf("Server: Heartbeat - Processed %d frames from screen...", frameCount)
 		}
 
-		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 		data := Decode(img, margin)
 		if data != nil {
 			log.Printf("Server: Decoded %d bytes from screen", len(data))
@@ -223,8 +242,12 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 		}
 
 		// 1. Отправляем CONNECT
+		log.Printf("Client: Sending CONNECT to %s", targetAddr)
 		connectImg := Encode(append([]byte{typeConnect}, []byte(targetAddr)...), margin)
-		writeToVCam(connectImg)
+		for j := 0; j < 5; j++ { // Отправляем 5 раз для надежности
+			writeToVCam(connectImg)
+			time.Sleep(100 * time.Millisecond)
+		}
 
 		// 2. Ждем ACK
 		log.Printf("Client: Waiting for ACK for %s", targetAddr)
