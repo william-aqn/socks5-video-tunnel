@@ -85,8 +85,12 @@ func runStatusUpdateLoop() {
 			captureStatus = "OK"
 		}
 
-		status := fmt.Sprintf("Live: %s | Frames: %d | Capture %s: %s",
-			time.Now().Format("15:04:05"), frameCount, target, captureStatus)
+		inFPS := getRecvFPS()
+		outFPS, _ := getPerfMetrics()
+		sentKBs, recvKBs := getTrafficStats()
+
+		status := fmt.Sprintf("Live: %s | FPS: %d/%d | Net: %.1f/%.1f KB/s | Frames: %d | Capture %s: %s",
+			time.Now().Format("15:04:05"), inFPS, int(outFPS), sentKBs, recvKBs, frameCount, target, captureStatus)
 
 		statusPtr, _ := syscall.UTF16PtrFromString(status)
 		procSetWindowTextW.Call(uintptr(hwndStatus), uintptr(unsafe.Pointer(statusPtr)))

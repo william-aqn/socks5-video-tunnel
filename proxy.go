@@ -72,6 +72,51 @@ var (
 	sentStats = make(map[byte]int)
 )
 
+var (
+	trafficMu          sync.Mutex
+	bytesSentTotal     int64
+	bytesReceivedTotal int64
+	lastTrafficCheck   time.Time
+	lastSentKBs        float64
+	lastRecvKBs        float64
+)
+
+func recordTrafficSent(n int) {
+	trafficMu.Lock()
+	defer trafficMu.Unlock()
+	bytesSentTotal += int64(n)
+}
+
+func recordTrafficRecv(n int) {
+	trafficMu.Lock()
+	defer trafficMu.Unlock()
+	bytesReceivedTotal += int64(n)
+}
+
+func getTrafficStats() (sentKBs, recvKBs float64) {
+	trafficMu.Lock()
+	defer trafficMu.Unlock()
+	now := time.Now()
+	if lastTrafficCheck.IsZero() {
+		lastTrafficCheck = now
+		return 0, 0
+	}
+	dur := now.Sub(lastTrafficCheck).Seconds()
+	if dur >= 1.0 {
+		lastSentKBs = float64(bytesSentTotal) / 1024.0 / dur
+		lastRecvKBs = float64(bytesReceivedTotal) / 1024.0 / dur
+		bytesSentTotal = 0
+		bytesReceivedTotal = 0
+		lastTrafficCheck = now
+	}
+	return lastSentKBs, lastRecvKBs
+}
+
+func sendEncodedPacket(payload []byte, margin int) {
+	recordTrafficSent(len(payload))
+	writeToVCam(Encode(payload, margin), margin)
+}
+
 func recordSentPacket(t byte) {
 	sentMu.Lock()
 	defer sentMu.Unlock()
@@ -188,7 +233,7 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 				if data[0] == typeData {
 					log.Printf("Dispatcher: Data for unknown connID %d (len: %d), sending DISCONNECT back", id, len(data))
 					payload := []byte{typeDisconnect, data[1], data[2]}
-					writeToVCam(Encode(payload, pd.margin), pd.margin)
+					sendEncodedPacket(payload, pd.margin)
 					recordSentPacket(typeDisconnect)
 				} else if data[0] == typeDisconnect {
 					log.Printf("Dispatcher: Disconnect for already unknown connID %d", id)
@@ -215,6 +260,7 @@ func (pd *PacketDispatcher) Run(video *ScreenVideoConn, margin int) {
 		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
 		data := Decode(img, margin)
 		if data != nil && len(data) > 0 {
+			recordTrafficRecv(len(data))
 			recordRecvFrame()
 			UpdateCaptureStatus(true)
 			pd.Dispatch(data)
@@ -403,7 +449,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	sendDisconnect := func() {
 		closeOnce.Do(func() {
 			payload := []byte{typeDisconnect, byte(connID >> 8), byte(connID)}
-			writeToVCam(Encode(payload, margin), margin)
+			sendEncodedPacket(payload, margin)
 			recordSentPacket(typeDisconnect)
 		})
 	}
@@ -488,7 +534,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				}
 				hbBytes, _ := json.Marshal(hb)
 				payload := append([]byte{typeHeartbeat}, hbBytes...)
-				writeToVCam(Encode(payload, margin), margin)
+				sendEncodedPacket(payload, margin)
 				recordSentPacket(typeHeartbeat)
 				lastHeartbeat = time.Now()
 
@@ -529,8 +575,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				payload[2] = byte(connID)
 				payload[3] = lastSentSeq
 				copy(payload[4:], buf[:n])
-				img := Encode(payload, margin)
-				writeToVCam(img, margin)
+				sendEncodedPacket(payload, margin)
 				recordSentPacket(typeData)
 				bytesSent += int64(n)
 				// log.Printf("Tunnel: Sent pkt seq=%d, len=%d (total sent: %d)", lastSentSeq, n, bytesSent)
@@ -625,7 +670,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
-		writeToVCam(Encode(nil, margin), margin)
+		sendEncodedPacket(nil, margin)
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -710,8 +755,7 @@ func RunScreenSocksServer(x, y, margin int) {
 								default:
 									resp := SyncData{SessionID: video.SessionID, Random: generateRandomString(32), MeasuredFPS: fps}
 									respBytes, _ := json.Marshal(resp)
-									img := Encode(append([]byte{typeSync}, respBytes...), margin)
-									writeToVCam(img, margin)
+									sendEncodedPacket(append([]byte{typeSync}, respBytes...), margin)
 									recordSentPacket(typeSync)
 									time.Sleep(10 * time.Millisecond) // Max rate 100 FPS
 								}
@@ -777,7 +821,7 @@ func RunScreenSocksServer(x, y, margin int) {
 					Phase:        0,
 				}
 				hbBytes, _ := json.Marshal(resp)
-				writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin), margin)
+				sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin)
 				recordSentPacket(typeHeartbeat)
 			}
 
@@ -808,7 +852,7 @@ func RunScreenSocksServer(x, y, margin int) {
 				payload[1] = byte(connID >> 8)
 				payload[2] = byte(connID)
 				payload[3] = 0 // Success
-				writeToVCam(Encode(payload, margin), margin)
+				sendEncodedPacket(payload, margin)
 				recordSentPacket(typeConnAck)
 				continue
 			}
@@ -827,7 +871,7 @@ func RunScreenSocksServer(x, y, margin int) {
 			payload[1] = byte(connID >> 8)
 			payload[2] = byte(connID)
 			payload[3] = status
-			writeToVCam(Encode(payload, margin), margin)
+			sendEncodedPacket(payload, margin)
 			recordSentPacket(typeConnAck)
 
 			if err == nil {
@@ -884,8 +928,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 					return
 				default:
 					syncPayload, _ := json.Marshal(SyncData{SessionID: sid, Random: generateRandomString(32)})
-					syncPacketImg := Encode(append([]byte{typeSync}, syncPayload...), margin)
-					writeToVCam(syncPacketImg, margin)
+					sendEncodedPacket(append([]byte{typeSync}, syncPayload...), margin)
 					recordSentPacket(typeSync)
 					time.Sleep(10 * time.Millisecond)
 				}
@@ -925,7 +968,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 							scd := SyncCompleteData{SessionID: video.SessionID, FPS: calculatedFPS}
 							scdBytes, _ := json.Marshal(scd)
 							for i := 0; i < 5; i++ { // Отправляем несколько раз для надежности
-								writeToVCam(Encode(append([]byte{typeSyncComplete}, scdBytes...), margin), margin)
+								sendEncodedPacket(append([]byte{typeSyncComplete}, scdBytes...), margin)
 								recordSentPacket(typeSyncComplete)
 								time.Sleep(50 * time.Millisecond)
 							}
@@ -1002,7 +1045,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						Seq:          hbSeq,
 					}
 					hbBytes, _ := json.Marshal(hb)
-					writeToVCam(Encode(append([]byte{typeHeartbeat}, hbBytes...), margin), margin)
+					sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin)
 					recordSentPacket(typeHeartbeat)
 				}
 			}
@@ -1030,7 +1073,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			payload[2] = byte(connID)
 			payload[3] = 1 // Initial seq for connect
 			copy(payload[4:], targetAddr)
-			writeToVCam(Encode(payload, margin), margin)
+			sendEncodedPacket(payload, margin)
 			recordSentPacket(typeConnect)
 
 			ch := pd.Register(connID)
@@ -1046,7 +1089,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 					}
 				case <-timer:
 					// Повторная отправка CONNECT если нет ответа 2 секунды
-					writeToVCam(Encode(payload, margin), margin)
+					sendEncodedPacket(payload, margin)
 					recordSentPacket(typeConnect)
 					timer = time.After(3 * time.Second) // Ждем еще до общего таймаута 5с
 				}

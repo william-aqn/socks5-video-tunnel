@@ -299,7 +299,7 @@ func main() {
 		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
 		// Отправим пустой кадр для инициализации MJPEG сервера
-		writeToVCam(Encode(nil, finalMargin), finalMargin)
+		sendEncodedPacket(nil, finalMargin)
 		defer cam.Close()
 	}
 
