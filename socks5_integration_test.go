@@ -24,12 +24,12 @@ func runSimpleSocks5Proxy(ln net.Listener) {
 
 			targetConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 			if err != nil {
-				_ = SendSocksResponse(c, err)
+				_ = SendSocksResponse(c, err, nil)
 				return
 			}
 			defer targetConn.Close()
 
-			err = SendSocksResponse(c, nil)
+			err = SendSocksResponse(c, nil, nil)
 			if err != nil {
 				return
 			}

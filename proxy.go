@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -71,6 +72,20 @@ var (
 	sentMu    sync.Mutex
 	sentStats = make(map[byte]int)
 )
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
+
+func getBuffer() []byte {
+	return bufferPool.Get().([]byte)
+}
+
+func putBuffer(b []byte) {
+	bufferPool.Put(b)
+}
 
 var (
 	trafficMu          sync.Mutex
@@ -231,10 +246,12 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 			} else {
 				// Пакет для неизвестного или уже закрытого соединения
 				if data[0] == typeData {
-					log.Printf("Dispatcher: Data for unknown connID %d (len: %d), sending DISCONNECT back", id, len(data))
-					payload := []byte{typeDisconnect, data[1], data[2]}
-					sendEncodedPacket(payload, pd.margin)
-					recordSentPacket(typeDisconnect)
+					log.Printf("Dispatcher: Data for unknown connID %d (len: %d), NOT sending DISCONNECT back (disabled)", id, len(data))
+					/*
+						payload := []byte{typeDisconnect, data[1], data[2]}
+						sendEncodedPacket(payload, pd.margin)
+						recordSentPacket(typeDisconnect)
+					*/
 				} else if data[0] == typeDisconnect {
 					log.Printf("Dispatcher: Disconnect for already unknown connID %d", id)
 				}
@@ -444,7 +461,8 @@ func vcamIdleHandler() {
 // runTunnelWithPrefix читает данные из dataConn, упаковывает их в видеокадры с префиксом типа и пишет в VCam.
 // Также получает пакеты из incoming канала и пишет в dataConn.
 func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, margin int, connID uint16, initialFPS int, incoming chan []byte) {
-	done := make(chan bool, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	var closeOnce sync.Once
 	sendDisconnect := func() {
 		closeOnce.Do(func() {
@@ -497,7 +515,8 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	go func() {
 		defer func() {
 			log.Printf("Tunnel: Exit Data->Video goroutine (ID: %d)", connID)
-			done <- true
+			sendDisconnect()
+			wg.Done()
 		}()
 		for {
 			fps := fpsLevels[fpsIdx]
@@ -553,12 +572,12 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				}
 			}
 
-			maxData := 490
-			buf := make([]byte, maxData)
+			maxData := 450
+			buf := getBuffer()
 			if tc, ok := dataConn.(interface{ SetReadDeadline(time.Time) error }); ok {
-				tc.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+				tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 			}
-			n, err := dataConn.Read(buf)
+			n, err := dataConn.Read(buf[:maxData])
 
 			if err == nil && n > 0 {
 				activityMu.Lock()
@@ -578,12 +597,14 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				sendEncodedPacket(payload, margin)
 				recordSentPacket(typeData)
 				bytesSent += int64(n)
-				// log.Printf("Tunnel: Sent pkt seq=%d, len=%d (total sent: %d)", lastSentSeq, n, bytesSent)
-				time.Sleep(sendInterval / 2)
-			} else if err != nil {
+			}
+			putBuffer(buf)
+
+			if err != nil {
 				if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-					log.Printf("Tunnel: dataConn read error (ID: %d): %v", connID, err)
-					sendDisconnect()
+					if err != io.EOF {
+						log.Printf("Tunnel: dataConn read error (ID: %d): %v", connID, err)
+					}
 					return
 				}
 			}
@@ -594,12 +615,11 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			}
 
 			activityMu.Lock()
-			inactive := time.Since(lastActivity) > 30*time.Second
+			inactive := time.Since(lastActivity) > 60*time.Second
 			activityMu.Unlock()
 
 			if inactive {
-				log.Printf("Tunnel: Inactive for 30s, closing (ID: %d)", connID)
-				sendDisconnect()
+				log.Printf("Tunnel: Inactive for 60s, closing (ID: %d)", connID)
 				return
 			}
 		}
@@ -608,7 +628,8 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	go func() {
 		defer func() {
 			log.Printf("Tunnel: Exit Video->Data goroutine (ID: %d)", connID)
-			done <- true
+			sendDisconnect()
+			wg.Done()
 		}()
 		var remoteSID int64
 		var lastRemoteHBSeq uint32
@@ -638,7 +659,6 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 					n, err := dataConn.Write(data[4:])
 					if err != nil {
 						log.Printf("Tunnel: dataConn write error (ID: %d): %v", connID, err)
-						sendDisconnect()
 						return
 					}
 					bytesReceived += int64(n)
@@ -666,7 +686,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 		}
 	}()
 
-	<-done
+	wg.Wait()
 	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
@@ -847,11 +867,14 @@ func RunScreenSocksServer(x, y, margin int) {
 
 			if alreadyActive {
 				// Просто подтверждаем еще раз, если это повтор
-				payload := make([]byte, 4)
+				// Для повтора отправляем пустой адрес, так как клиент уже должен иметь его или он ему не важен
+				payload := make([]byte, 4+1+4+2)
 				payload[0] = typeConnAck
 				payload[1] = byte(connID >> 8)
 				payload[2] = byte(connID)
-				payload[3] = 0 // Success
+				payload[3] = socks5RespSuccess
+				payload[4] = socks5AtypIPv4
+				// остальное нули
 				sendEncodedPacket(payload, margin)
 				recordSentPacket(typeConnAck)
 				continue
@@ -860,17 +883,47 @@ func RunScreenSocksServer(x, y, margin int) {
 			log.Printf("Server: Decoded CONNECT to %s (ID: %d, seq: %d)", targetAddr, connID, seq)
 
 			targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
-			status := byte(0)
+			status := byte(socks5RespSuccess)
+			var boundAddr []byte
+			atyp := byte(socks5AtypIPv4)
+			port := uint16(0)
+
 			if err != nil {
 				log.Printf("Server: dial failed to %s: %v", targetAddr, err)
-				status = 1
+				status = socks5RespFailure
+				errStr := err.Error()
+				if strings.Contains(errStr, "refused") {
+					status = socks5RespConnRefused
+				} else if strings.Contains(errStr, "unreachable") {
+					status = socks5RespHostUnreach
+				} else if strings.Contains(errStr, "timeout") {
+					status = socks5RespTTLExpired
+				}
+			} else {
+				if tcpAddr, ok := targetConn.LocalAddr().(*net.TCPAddr); ok {
+					if ip4 := tcpAddr.IP.To4(); ip4 != nil {
+						atyp = socks5AtypIPv4
+						boundAddr = ip4
+					} else {
+						atyp = socks5AtypIPv6
+						boundAddr = tcpAddr.IP
+					}
+					port = uint16(tcpAddr.Port)
+				}
 			}
 
-			payload := make([]byte, 4)
+			if boundAddr == nil {
+				boundAddr = make([]byte, 4)
+			}
+
+			payload := make([]byte, 4+1+len(boundAddr)+2)
 			payload[0] = typeConnAck
 			payload[1] = byte(connID >> 8)
 			payload[2] = byte(connID)
 			payload[3] = status
+			payload[4] = atyp
+			copy(payload[5:], boundAddr)
+			binary.BigEndian.PutUint16(payload[5+len(boundAddr):], port)
 			sendEncodedPacket(payload, margin)
 			recordSentPacket(typeConnAck)
 
@@ -1078,13 +1131,31 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 
 			ch := pd.Register(connID)
 			success := false
+			var remoteBoundAddr net.Addr
+			var lastStatus byte = socks5RespFailure
 			timer := time.After(5 * time.Second)
 		WaitAck:
 			for {
 				select {
 				case data := <-ch:
 					if data[0] == typeConnAck && len(data) >= 4 {
-						success = (data[3] == 0)
+						lastStatus = data[3]
+						success = (lastStatus == socks5RespSuccess)
+						if success && len(data) >= 7 {
+							atyp := data[4]
+							var ip net.IP
+							var port uint16
+							if atyp == socks5AtypIPv4 && len(data) >= 11 {
+								ip = net.IP(data[5:9])
+								port = binary.BigEndian.Uint16(data[9:11])
+							} else if atyp == socks5AtypIPv6 && len(data) >= 23 {
+								ip = net.IP(data[5:21])
+								port = binary.BigEndian.Uint16(data[21:23])
+							}
+							if ip != nil {
+								remoteBoundAddr = &net.TCPAddr{IP: ip, Port: int(port)}
+							}
+						}
 						break WaitAck
 					}
 				case <-timer:
@@ -1096,14 +1167,20 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 			}
 
 			if !success {
-				log.Printf("Client: Failed to establish tunnel to %s (ID: %d)", targetAddr, connID)
+				log.Printf("Client: Failed to establish tunnel to %s (ID: %d), status: 0x%02x", targetAddr, connID, lastStatus)
 				pd.Unregister(connID)
-				_ = SendSocksResponse(localConn, fmt.Errorf("failed"))
+				var err error
+				if lastStatus != socks5RespSuccess {
+					err = fmt.Errorf("socks5 error: 0x%02x", lastStatus)
+				} else {
+					err = fmt.Errorf("failed")
+				}
+				_ = SendSocksResponse(localConn, err, nil)
 				localConn.Close()
 				continue
 			}
 
-			_ = SendSocksResponse(localConn, nil)
+			_ = SendSocksResponse(localConn, nil, remoteBoundAddr)
 			log.Printf("Client: Tunnel established to %s (ID: %d)", targetAddr, connID)
 
 			go func() {

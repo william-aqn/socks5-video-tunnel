@@ -59,6 +59,19 @@ var (
 	}
 )
 
+var DataPalette = []color.RGBA{
+	{0, 0, 0, 255},       // 000
+	{255, 0, 0, 255},     // 001
+	{0, 255, 0, 255},     // 010
+	{0, 0, 255, 255},     // 011
+	{255, 255, 0, 255},   // 100
+	{255, 0, 255, 255},   // 101
+	{0, 255, 255, 255},   // 110
+	{255, 255, 255, 255}, // 111
+}
+
+const bitsPerBlock = 3
+
 var CurrentMode string // "client" or "server"
 
 func matchRange(r, g, b uint8, cr ColorRange) bool {
@@ -359,9 +372,9 @@ func Encode(data []byte, margin int) *image.RGBA {
 
 	// Подготовка данных с избыточностью
 	dataLen := len(data)
-	// Блок: [Версия 0x01][Длина 2][Данные][CRC16 2]
+	// Блок: [Версия 0x02][Длина 2][Данные][CRC16 2]
 	header := []byte{
-		0x01,
+		0x02,
 		byte(dataLen >> 8),
 		byte(dataLen),
 	}
@@ -388,8 +401,8 @@ func Encode(data []byte, margin int) *image.RGBA {
 	bitIdx := 0
 	for y := margin; y <= height-margin-blockSize; y += blockSize {
 		for x := margin; x <= width-margin-blockSize; x += blockSize {
-			// Пропускаем контрольные точки (зона 32x32 для стабильности поиска)
-			if (x < 32 && y < 32) || (x >= width-32 && y < 32) || (x < 32 && y >= height-32) || (x >= width-32 && y >= height-32) {
+			// Пропускаем контрольные точки (зона 16x16 для стабильности поиска)
+			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
 				continue
 			}
 			// Пропускаем Timing Patterns (они на краях x=1, y=1)
@@ -398,10 +411,15 @@ func Encode(data []byte, margin int) *image.RGBA {
 			}
 
 			if bitIdx < len(bits) {
-				c := color.RGBA{0, 0, 0, 255} // 0 = Black
-				if bits[bitIdx] {
-					c = color.RGBA{255, 255, 255, 255} // 1 = White
+				val := 0
+				for i := 0; i < bitsPerBlock; i++ {
+					if bitIdx+i < len(bits) {
+						if bits[bitIdx+i] {
+							val |= 1 << uint(bitsPerBlock-1-i)
+						}
+					}
 				}
+				c := DataPalette[val]
 
 				// Рисуем блок
 				for dy := 0; dy < blockSize; dy++ {
@@ -409,7 +427,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 						img.SetRGBA(x+dx, y+dy, c)
 					}
 				}
-				bitIdx++
+				bitIdx += bitsPerBlock
 			} else {
 				// Просто пропускаем
 			}
@@ -424,67 +442,27 @@ func Encode(data []byte, margin int) *image.RGBA {
 
 // Decode извлекает данные из изображения.
 func Decode(img *image.RGBA, margin int) []byte {
-	// Ищем центры 4-х угловых маркеров
-	findCenter := func(cr ColorRange, sx, sy, sw, sh int) (float64, float64, bool) {
-		var sumX, sumY float64
-		var count float64
-		for y := sy; y < sy+sh; y++ {
-			for x := sx; x < sx+sw; x++ {
-				if x < 0 || x >= img.Bounds().Dx() || y < 0 || y >= img.Bounds().Dy() {
-					continue
-				}
-				c := img.RGBAAt(x, y)
-				if matchRange(c.R, c.G, c.B, cr) {
-					sumX += float64(x)
-					sumY += float64(y)
-					count++
-				}
-			}
-		}
-		if count < 5 { // Минимум 5 пикселей для маркера 8x8 (устойчивость к шуму/сжатию)
-			return 0, 0, false
-		}
-		return sumX / count, sumY / count, true
-	}
-
-	ranges := ServerRanges
-	if CurrentMode == "server" {
-		ranges = ClientRanges
-	}
-
-	// TL (левый верхний)
-	rx, ry, okR := findCenter(ranges.TL, 0, 0, 150, 150)
-	if !okR {
+	offsetX, offsetY, ok := FindMarkers(img, CurrentMode)
+	if !ok {
 		return nil
 	}
 
-	// TR (правый верхний)
-	gx, gy, okG := findCenter(ranges.TR, int(rx)+624-50, int(ry)-50, 100, 100)
-	// BL (левый нижний)
-	bx, by, okB := findCenter(ranges.BL, int(rx)-50, int(ry)+464-50, 100, 100)
-	// BR (правый нижний)
-	qx, qy, okQ := findCenter(ranges.BR, int(rx)+624-50, int(ry)+464-50, 100, 100)
-
-	if !okG || !okB || !okQ {
-		// Если не все маркеры найдены, используем линейную экстраполяцию от тех что есть
-		if !okG {
-			gx, gy = rx+624, ry
-		}
-		if !okB {
-			bx, by = rx, ry+464
-		}
-		if !okQ {
-			qx, qy = gx, by
-		}
-	}
+	// Координаты центров маркеров для трансформации
+	rx, ry := float64(offsetX+markerOffset+markerSize/2), float64(offsetY+markerOffset+markerSize/2)
+	gx, gy := float64(offsetX+width-markerOffset-markerSize/2), float64(offsetY+markerOffset+markerSize/2)
+	bx, by := float64(offsetX+markerOffset+markerSize/2), float64(offsetY+height-markerOffset-markerSize/2)
+	qx, qy := float64(offsetX+width-markerOffset-markerSize/2), float64(offsetY+height-markerOffset-markerSize/2)
 
 	// Функция для билинейной интерполяции координат
 	// u, v - идеальные координаты в сетке 640x480
 	transform := func(u, v float64) (float64, float64) {
-		// Нормализуем координаты к [0, 1] относительно области между маркерами
-		// Маркеры находятся в 8, 8 (TL) и т.д.
-		fu := (u - 8.0) / 624.0
-		fv := (v - 8.0) / 464.0
+		// Нормализуем координаты к [0, 1] относительно центров маркеров
+		// Центры находятся в 8, 8 (TL) и т.д. при markerOffset=4, markerSize=8
+		distX := float64(width - markerSize - 2*markerOffset)
+		distY := float64(height - markerSize - 2*markerOffset)
+
+		fu := (u - float64(markerOffset+markerSize/2)) / distX
+		fv := (v - float64(markerOffset+markerSize/2)) / distY
 
 		// Билинейная интерполяция
 		x := rx*(1-fu)*(1-fv) + gx*fu*(1-fv) + bx*(1-fu)*fv + qx*fu*fv
@@ -496,7 +474,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 	for y := margin; y <= height-margin-blockSize; y += blockSize {
 		for x := margin; x <= width-margin-blockSize; x += blockSize {
 			// Пропускаем контрольные точки и Timing Patterns (как в Encode)
-			if (x < 32 && y < 32) || (x >= width-32 && y < 32) || (x < 32 && y >= height-32) || (x >= width-32 && y >= height-32) {
+			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
 				continue
 			}
 			if x < 6 || y < 6 {
@@ -504,7 +482,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 			}
 
 			// Сэмплируем блок 3x3 в центре для устойчивости к шуму
-			var sumBrightness uint32
+			var sumR, sumG, sumB uint32
 			points := 0
 			for dy := -1; dy <= 1; dy++ {
 				for dx := -1; dx <= 1; dx++ {
@@ -513,16 +491,37 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 					if px >= 0 && px < img.Bounds().Dx() && py >= 0 && py < img.Bounds().Dy() {
 						c := img.RGBAAt(px, py)
-						sumBrightness += (uint32(c.R) + uint32(c.G) + uint32(c.B)) / 3
+						sumR += uint32(c.R)
+						sumG += uint32(c.G)
+						sumB += uint32(c.B)
 						points++
 					}
 				}
 			}
 
 			if points > 0 {
-				bits = append(bits, (sumBrightness/uint32(points)) > 128)
+				avgColor := color.RGBA{uint8(sumR / uint32(points)), uint8(sumG / uint32(points)), uint8(sumB / uint32(points)), 255}
+				// Находим ближайший цвет в палитре
+				minDist := 1000000
+				bestIdx := 0
+				for i, pc := range DataPalette {
+					dr := int(avgColor.R) - int(pc.R)
+					dg := int(avgColor.G) - int(pc.G)
+					db := int(avgColor.B) - int(pc.B)
+					dist := dr*dr + dg*dg + db*db
+					if dist < minDist {
+						minDist = dist
+						bestIdx = i
+					}
+				}
+				// Из индекса получаем bitsPerBlock бит
+				for i := 0; i < bitsPerBlock; i++ {
+					bits = append(bits, (bestIdx>>uint(bitsPerBlock-1-i))&1 == 1)
+				}
 			} else {
-				bits = append(bits, false)
+				for i := 0; i < bitsPerBlock; i++ {
+					bits = append(bits, false)
+				}
 			}
 		}
 	}
@@ -554,7 +553,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 		if len(d) < 5 {
 			return nil
 		}
-		if d[0] != 0x01 { // Неверная версия
+		if d[0] != 0x02 && d[0] != 0x01 {
 			return nil
 		}
 		dataLen := int(d[1])<<8 | int(d[2])

@@ -31,7 +31,7 @@ func TestSocks5Handshake(t *testing.T) {
 			return
 		}
 		addrChan <- target
-		_ = SendSocksResponse(conn, nil)
+		_ = SendSocksResponse(conn, nil, nil)
 	}()
 
 	client, err := net.Dial("tcp", ln.Addr().String())
