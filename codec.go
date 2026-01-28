@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"log"
 )
+
+var decodeErrorCount int
 
 const (
 	width         = 640
@@ -79,20 +82,58 @@ func FindMarkers(img *image.RGBA, mode string) (int, int, bool) {
 	distX := width - markerSize - 2*markerOffset
 	distY := height - markerSize - 2*markerOffset
 
-	// Сканируем изображение в поисках TL маркера
-	for y := 0; y < img.Rect.Dy()-height+markerSize; y += 2 {
-		for x := 0; x < img.Rect.Dx()-width+markerSize; x += 2 {
-			c := img.RGBAAt(x, y)
-			if matchRange(c.R, c.G, c.B, ranges.TL) {
-				// Проверяем остальные маркеры на ожидаемых расстояниях
-				if x+distX+markerSize < img.Rect.Dx() && y+distY+markerSize < img.Rect.Dy() {
-					cTR := img.RGBAAt(x+distX, y)
-					cBL := img.RGBAAt(x, y+distY)
-					cBR := img.RGBAAt(x+distX, y+distY)
+	checkMarker := func(x, y int, cr ColorRange) bool {
+		count := 0
+		for dy := 0; dy < markerSize; dy++ {
+			for dx := 0; dx < markerSize; dx++ {
+				if x+dx >= 0 && x+dx < img.Rect.Dx() && y+dy >= 0 && y+dy < img.Rect.Dy() {
+					c := img.RGBAAt(x+dx, y+dy)
+					if matchRange(c.R, c.G, c.B, cr) {
+						count++
+					}
+				}
+			}
+		}
+		return count > (markerSize * markerSize / 4) // Хотя бы четверть пикселей совпала (устойчивость к шуму)
+	}
 
-					if matchRange(cTR.R, cTR.G, cTR.B, ranges.TR) &&
-						matchRange(cBL.R, cBL.G, cBL.B, ranges.BL) &&
-						matchRange(cBR.R, cBR.G, cBR.B, ranges.BR) {
+	// Сканируем изображение в поисках TL маркера
+	for y := 0; y < img.Rect.Dy()-height+markerSize; y++ {
+		for x := 0; x < img.Rect.Dx()-width+markerSize; x++ {
+			c := img.RGBAAt(x, y)
+			// Быстрая проверка первого пикселя (или любого в маркере)
+			if matchRange(c.R, c.G, c.B, ranges.TL) {
+				// Проверяем TL маркер целиком
+				if checkMarker(x, y, ranges.TL) {
+					// Проверяем остальные маркеры на ожидаемых расстояниях (с небольшим допуском +-2 пикселя)
+					foundOthers := true
+					for _, offset := range []struct {
+						dx, dy int
+						r      ColorRange
+					}{
+						{distX, 0, ranges.TR},
+						{0, distY, ranges.BL},
+						{distX, distY, ranges.BR},
+					} {
+						ok := false
+						for dy := -2; dy <= 2; dy++ {
+							for dx := -2; dx <= 2; dx++ {
+								if checkMarker(x+offset.dx+dx, y+offset.dy+dy, offset.r) {
+									ok = true
+									break
+								}
+							}
+							if ok {
+								break
+							}
+						}
+						if !ok {
+							foundOthers = false
+							break
+						}
+					}
+
+					if foundOthers {
 						return x - markerOffset, y - markerOffset, true
 					}
 				}
@@ -229,7 +270,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 				}
 			}
 		}
-		if count < 10 { // Минимум 10 пикселей для маркера 8x8
+		if count < 5 { // Минимум 5 пикселей для маркера 8x8 (устойчивость к шуму/сжатию)
 			return 0, 0, false
 		}
 		return sumX / count, sumY / count, true
@@ -243,6 +284,10 @@ func Decode(img *image.RGBA, margin int) []byte {
 	// TL (левый верхний)
 	rx, ry, okR := findCenter(ranges.TL, 0, 0, 150, 150)
 	if !okR {
+		decodeErrorCount++
+		if decodeErrorCount%100 == 0 {
+			log.Printf("Decode: TL marker not found (mode: %s, count: %d)", CurrentMode, decodeErrorCount)
+		}
 		return nil
 	}
 

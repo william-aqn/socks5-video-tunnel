@@ -68,15 +68,9 @@ func CaptureScreen(x, y, w, h int) (*image.RGBA, error) {
 func CaptureScreenEx(hwnd syscall.Handle, x, y, w, h int) (*image.RGBA, error) {
 	var hdcSrc uintptr
 	if hwnd != 0 {
-		var rect RECT
-		procGetClientRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
-		// log.Printf("CaptureScreenEx: HWND %v ClientRect: %+v", hwnd, rect)
-
 		res, _, _ := procGetDC.Call(uintptr(hwnd))
 		hdcSrc = res
 		defer procReleaseDC.Call(uintptr(hwnd), hdcSrc)
-		x = 0
-		y = 25
 	} else {
 		res, _, _ := procGetDC.Call(0)
 		hdcSrc = res

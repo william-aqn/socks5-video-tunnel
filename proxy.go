@@ -246,9 +246,9 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 }
 
 func (pd *PacketDispatcher) Run(video *ScreenVideoConn, margin int) {
+	frameSize := captureWidth * captureHeight * 4
+	buf := make([]byte, frameSize)
 	for {
-		frameSize := captureWidth * captureHeight * 4
-		buf := make([]byte, frameSize)
 		startTime := time.Now()
 		_, err := io.ReadFull(video, buf)
 		if err != nil {
