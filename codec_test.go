@@ -5,6 +5,16 @@ import (
 	"testing"
 )
 
+func TestCRC8(t *testing.T) {
+	data := []byte("hello")
+	c1 := crc8(data)
+	data[0] = 'H'
+	c2 := crc8(data)
+	if c1 == c2 {
+		t.Errorf("CRC8 should be different for different data")
+	}
+}
+
 func TestEncodeDecode(t *testing.T) {
 	CurrentMode = "client"
 	data := []byte("Hello, video stream! This is a test message to see if encoding and decoding works correctly.")

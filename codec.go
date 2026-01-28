@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"log"
 )
 
 const (
@@ -46,16 +45,16 @@ var (
 
 var (
 	ClientRanges = MarkerRanges{
-		TL: ColorRange{160, 255, 0, 120, 0, 120},     // Red
-		TR: ColorRange{0, 120, 160, 255, 0, 120},     // Green
-		BL: ColorRange{0, 120, 0, 120, 160, 255},     // Blue
-		BR: ColorRange{160, 255, 160, 255, 160, 255}, // White
+		TL: ColorRange{130, 255, 0, 140, 0, 140},     // Red
+		TR: ColorRange{0, 140, 130, 255, 0, 140},     // Green
+		BL: ColorRange{0, 140, 0, 140, 130, 255},     // Blue
+		BR: ColorRange{130, 255, 130, 255, 130, 255}, // White
 	}
 	ServerRanges = MarkerRanges{
-		TL: ColorRange{0, 120, 160, 255, 160, 255}, // Cyan
-		TR: ColorRange{160, 255, 0, 120, 160, 255}, // Magenta
-		BL: ColorRange{160, 255, 160, 255, 0, 120}, // Yellow
-		BR: ColorRange{160, 255, 120, 220, 0, 120}, // Orange
+		TL: ColorRange{0, 140, 130, 255, 130, 255}, // Cyan
+		TR: ColorRange{130, 255, 0, 140, 130, 255}, // Magenta
+		BL: ColorRange{130, 255, 130, 255, 0, 140}, // Yellow
+		BR: ColorRange{130, 255, 100, 230, 0, 140}, // Orange
 	}
 )
 
@@ -103,8 +102,22 @@ func FindMarkers(img *image.RGBA, mode string) (int, int, bool) {
 	return 0, 0, false
 }
 
+func crc8(data []byte) byte {
+	var crc byte
+	for _, b := range data {
+		crc ^= b
+		for i := 0; i < 8; i++ {
+			if (crc & 0x80) != 0 {
+				crc = (crc << 1) ^ 0x07 // Polynomial 0x07
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
 // Encode записывает данные в пиксели изображения.
-// Используем 1 бит на блок blockSize x blockSize пикселей для максимальной надежности.
 func Encode(data []byte, margin int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
@@ -131,7 +144,7 @@ func Encode(data []byte, margin int) *image.RGBA {
 	if CurrentMode == "server" {
 		markers = ServerMarkers
 	}
-	log.Printf("Codec: Encoding %d bytes in %s mode (TL Color: %+v)", len(data), CurrentMode, markers.TL)
+	// log.Printf("Codec: Encoding %d bytes in %s mode", len(data), CurrentMode)
 
 	drawMarker(markerOffset, markerOffset, markers.TL)
 	drawMarker(width-markerSize-markerOffset, markerOffset, markers.TR)
@@ -146,6 +159,8 @@ func Encode(data []byte, margin int) *image.RGBA {
 	}
 
 	fullData := append(header, data...)
+	checksum := crc8(fullData)
+	fullData = append(fullData, checksum)
 
 	// Превращаем данные в поток бит
 	bits := make([]bool, 0, len(fullData)*8)
@@ -195,6 +210,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 	findCenter := func(cr ColorRange, sx, sy, sw, sh int) (float64, float64, bool) {
 		var sumX, sumY float64
 		var count float64
+		// log.Printf("Codec: findCenter searching in x=[%d,%d], y=[%d,%d]", sx, sx+sw, sy, sy+sh)
 		for y := sy; y < sy+sh; y++ {
 			for x := sx; x < sx+sw; x++ {
 				if x < 0 || x >= img.Bounds().Dx() || y < 0 || y >= img.Bounds().Dy() {
@@ -210,7 +226,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 				}
 			}
 		}
-		if count < 4 { // Минимум 4 пикселя для маркера 8x8 (с запасом на размытие)
+		if count < 10 { // Минимум 10 пикселей для маркера 8x8
 			return 0, 0, false
 		}
 		return sumX / count, sumY / count, true
@@ -228,19 +244,19 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 
 	// TR (правый верхний) - ищем в правой половине
-	gx, _, okG := findCenter(ranges.TR, 300, 0, img.Bounds().Dx()-300, 150)
+	gx, _, okG := findCenter(ranges.TR, int(rx)+624-50, int(ry)-50, 100, 100)
 	if !okG {
 		// log.Printf("Codec: TR marker not found")
 	}
 
 	// BL (левый нижний) - ищем в нижней половине
-	_, by, okB := findCenter(ranges.BL, 0, 300, 150, img.Bounds().Dy()-300)
+	_, by, okB := findCenter(ranges.BL, int(rx)-50, int(ry)+464-50, 100, 100)
 	if !okB {
 		// log.Printf("Codec: BL marker not found")
 	}
 
 	// BR (правый нижний) - ищем в правой нижней четверти
-	_, _, okW := findCenter(ranges.BR, 300, 300, img.Bounds().Dx()-300, img.Bounds().Dy()-300)
+	_, _, okW := findCenter(ranges.BR, int(rx)+624-50, int(ry)+464-50, 100, 100)
 	if !okW {
 		// log.Printf("Codec: BR marker not found")
 	}
@@ -314,17 +330,21 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 
 	dataLen := int(fullData[0])<<8 | int(fullData[1])
-	if dataLen <= 0 || dataLen > 2000 {
-		if dataLen != 0 && dataLen < 5000 {
-			log.Printf("Codec: potential data detected but dataLen %d invalid. First bytes: %02x %02x", dataLen, fullData[0], fullData[1])
-		}
+	if dataLen < 0 || dataLen > 2000 {
 		return nil
 	}
-	if dataLen > len(fullData)-2 {
-		// log.Printf("Codec: dataLen %d > available %d", dataLen, len(fullData)-2)
+	if dataLen > len(fullData)-3 { // -2 для длины, -1 для CRC
 		return nil
 	}
 
-	// log.Printf("Codec: Successfully decoded %d bytes: %v", dataLen, fullData[2:2+dataLen])
+	// Проверка CRC
+	expectedCRC := fullData[2+dataLen]
+	actualCRC := crc8(fullData[:2+dataLen])
+	if expectedCRC != actualCRC {
+		// log.Printf("Codec: CRC mismatch! Len=%d, Expected %02x, got %02x", dataLen, expectedCRC, actualCRC)
+		return nil
+	}
+
+	// log.Printf("Codec: Successfully decoded %d bytes: %02x", dataLen, fullData[2:2+dataLen])
 	return fullData[2 : 2+dataLen]
 }
