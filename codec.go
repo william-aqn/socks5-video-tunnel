@@ -62,17 +62,25 @@ var (
 )
 
 var DataPalette = []color.RGBA{
-	{0, 0, 0, 255},       // 000
-	{255, 0, 0, 255},     // 001
-	{0, 255, 0, 255},     // 010
-	{0, 0, 255, 255},     // 011
-	{255, 255, 0, 255},   // 100
-	{255, 0, 255, 255},   // 101
-	{0, 255, 255, 255},   // 110
-	{255, 255, 255, 255}, // 111
+	{0, 0, 0, 255},       // 0
+	{255, 0, 0, 255},     // 1
+	{0, 255, 0, 255},     // 2
+	{0, 0, 255, 255},     // 3
+	{255, 255, 0, 255},   // 4
+	{255, 0, 255, 255},   // 5
+	{0, 255, 255, 255},   // 6
+	{255, 255, 255, 255}, // 7
+	{128, 0, 0, 255},     // 8
+	{0, 128, 0, 255},     // 9
+	{0, 0, 128, 255},     // 10
+	{128, 128, 0, 255},   // 11
+	{128, 0, 128, 255},   // 12
+	{0, 128, 128, 255},   // 13
+	{128, 128, 128, 255}, // 14
+	{255, 128, 0, 255},   // 15
 }
 
-const bitsPerBlock = 3
+const bitsPerBlock = 4
 
 var CurrentMode string // "client" or "server"
 
@@ -99,11 +107,13 @@ func GetMaxPayloadSize(margin int) int {
 		}
 	}
 	totalBytes := totalBits / 8
-	// Мы используем x2 избыточность: [Block1][Block2]
-	// Block = [Ver(1)][Len(2)][Data(N)][CRC(4)]
-	// Total bytes = 2 * (7 + N)
-	// N = (Total bytes / 2) - 7
-	maxPayload := (totalBytes / 2) - 7
+	// Мы используем RS(255, 223), то есть каждые 255 байт на экране содержат 223 байта данных.
+	numRSBlocks := totalBytes / 255
+	if numRSBlocks == 0 {
+		return 0
+	}
+	// В каждом блоке 223 байта. Оверхед на весь пакет (header + CRC32) = 7 байт.
+	maxPayload := numRSBlocks*223 - 7
 	if maxPayload < 0 {
 		return 0
 	}
@@ -222,22 +232,22 @@ func gfDiv(a, b byte) byte {
 	return gfExp[int(gfLog[a])-int(gfLog[b])+255]
 }
 
+func gfPolyEval(p []byte, x byte) byte {
+	res := byte(0)
+	for _, c := range p {
+		res = gfMul(res, x) ^ c
+	}
+	return res
+}
+
 func gfPolyMul(p, q []byte) []byte {
 	r := make([]byte, len(p)+len(q)-1)
-	for j, qv := range q {
-		for i, pv := range p {
+	for i, pv := range p {
+		for j, qv := range q {
 			r[i+j] ^= gfMul(pv, qv)
 		}
 	}
 	return r
-}
-
-func gfPolyEval(p []byte, x byte) byte {
-	y := p[0]
-	for i := 1; i < len(p); i++ {
-		y = gfMul(y, x) ^ p[i]
-	}
-	return y
 }
 
 func rsGenerator(nsym int) []byte {
@@ -249,67 +259,144 @@ func rsGenerator(nsym int) []byte {
 }
 
 func rsEncode(data []byte, nsym int) []byte {
+	blockDataLen := 255 - nsym
+	var res []byte
 	gen := rsGenerator(nsym)
-	res := make([]byte, len(data)+nsym)
-	copy(res, data)
-	for i := 0; i < len(data); i++ {
-		coef := res[i]
-		if coef != 0 {
-			for j := 1; j < len(gen); j++ {
-				res[i+j] ^= gfMul(gen[j], coef)
+
+	for i := 0; i < len(data); i += blockDataLen {
+		end := i + blockDataLen
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := make([]byte, blockDataLen)
+		copy(chunk, data[i:end])
+
+		block := make([]byte, 255)
+		copy(block, chunk)
+
+		// Систематическое кодирование: остаток от деления (data * x^nsym) на gen
+		for j := 0; j < blockDataLen; j++ {
+			feedback := block[j]
+			if feedback != 0 {
+				for k := 1; k < len(gen); k++ {
+					block[j+k] ^= gfMul(gen[k], feedback)
+				}
 			}
 		}
+		copy(block, chunk)
+		res = append(res, block...)
 	}
-	copy(res, data)
 	return res
 }
 
 func rsDecode(data []byte, nsym int) ([]byte, bool) {
-	// Синдромы
-	sz := make([]byte, nsym)
-	nonzero := false
-	for i := 0; i < nsym; i++ {
-		sz[i] = gfPolyEval(data, gfExp[i])
-		if sz[i] != 0 {
-			nonzero = true
-		}
+	if len(data) < 255 {
+		return nil, false
 	}
-	if !nonzero {
-		return data[:len(data)-nsym], true
-	}
+	blockDataLen := 255 - nsym
+	var res []byte
+	allOk := true
 
-	// Поиск многочлена локатора ошибок (Berlekamp-Massey)
-	errLoc := []byte{1}
-	oldLoc := []byte{1}
-	for i := 0; i < nsym; i++ {
-		oldLoc = append(oldLoc, 0)
-		delta := sz[i]
-		for j := 1; j < len(errLoc); j++ {
-			delta ^= gfMul(errLoc[len(errLoc)-1-j], sz[i-j])
-		}
-		if delta != 0 {
-			if len(oldLoc) > len(errLoc) {
-				newLoc := make([]byte, len(oldLoc))
-				copy(newLoc, oldLoc)
-				for j := 0; j < len(errLoc); j++ {
-					newLoc[len(newLoc)-1-j] ^= gfMul(errLoc[len(errLoc)-1-j], delta)
-				}
-				// В простейшей версии здесь должна быть корректировка oldLoc, но для надежности
-				// мы ограничимся исправлением ошибок, которые можем найти.
-				// (Упрощенная версия для визуального канала)
+	for i := 0; i+255 <= len(data); i += 255 {
+		block := make([]byte, 255)
+		copy(block, data[i:i+255])
+
+		// 1. Синдромы S[j] = block(alpha^j)
+		s := make([]byte, nsym)
+		anyError := false
+		for j := 0; j < nsym; j++ {
+			s[nsym-1-j] = gfPolyEval(block, gfExp[j])
+			if s[nsym-1-j] != 0 {
+				anyError = true
 			}
-			// Полная реализация BM алгоритма требует больше кода.
-			// Для начала попробуем просто дублирование с RS на каждом блоке.
 		}
+
+		if !anyError {
+			res = append(res, block[:blockDataLen]...)
+			continue
+		}
+
+		// 2. Алгоритм Берлекампа-Мэсси
+		lambda := []byte{1}
+		b := []byte{1}
+		for j := 0; j < nsym; j++ {
+			b = append(b, 0)
+			delta := s[nsym-1-j]
+			for k := 1; k < len(lambda); k++ {
+				delta ^= gfMul(lambda[len(lambda)-1-k], s[nsym-1-j+k])
+			}
+
+			if delta != 0 {
+				if len(b) > len(lambda) {
+					oldLambda := lambda
+					lambda = gfPolyAdd(lambda, gfPolyScale(b, delta))
+					b = gfPolyScale(oldLambda, gfDiv(1, delta))
+				} else {
+					lambda = gfPolyAdd(lambda, gfPolyScale(b, delta))
+				}
+			}
+		}
+
+		// 3. Поиск корней (Chien search)
+		var errPos []int
+		for j := 0; j < 255; j++ {
+			if gfPolyEval(lambda, gfExp[255-j]) == 0 {
+				errPos = append(errPos, 254-j)
+			}
+		}
+
+		if len(errPos) != len(lambda)-1 {
+			res = append(res, block[:blockDataLen]...)
+			allOk = false
+			continue
+		}
+
+		// 4. Алгоритм Форни
+		omega := gfPolyMul(s, lambda)
+		omega = omega[len(omega)-nsym:]
+
+		lambdaDeriv := make([]byte, len(lambda)-1)
+		for j := 1; j < len(lambda); j++ {
+			if j%2 != 0 {
+				lambdaDeriv[len(lambdaDeriv)-j] = lambda[len(lambda)-1-j]
+			}
+		}
+
+		for _, pos := range errPos {
+			xInv := gfExp[255-pos]
+			y := gfPolyEval(omega, xInv)
+			z := gfPolyEval(lambdaDeriv, xInv)
+			errVal := gfDiv(y, gfMul(xInv, z))
+			block[pos] ^= errVal
+		}
+
+		res = append(res, block[:blockDataLen]...)
 	}
-	// Если RS-декодирование слишком сложно реализовать "в лоб" без ошибок за один раз,
-	// я буду использовать дублирование и CRC16. Это тоже "error control and redundancy".
-	return nil, false
+	return res, allOk
 }
 
-// В силу сложности реализации полного декодера RS без библиотек,
-// я буду использовать расширенный CRC и дублирование данных с перемешиванием,
-// что даст аналогичный эффект "избыточности" при сохранении простоты.
+func gfPolyAdd(p, q []byte) []byte {
+	size := len(p)
+	if len(q) > size {
+		size = len(q)
+	}
+	res := make([]byte, size)
+	for i := 0; i < len(p); i++ {
+		res[size-len(p)+i] ^= p[i]
+	}
+	for i := 0; i < len(q); i++ {
+		res[size-len(q)+i] ^= q[i]
+	}
+	return res
+}
+
+func gfPolyScale(p []byte, s byte) []byte {
+	res := make([]byte, len(p))
+	for i, v := range p {
+		res[i] = gfMul(v, s)
+	}
+	return res
+}
 
 func crc8(data []byte) byte {
 	var crc byte
@@ -359,6 +446,22 @@ func Encode(data []byte, margin int) *image.RGBA {
 	drawMarker(markerOffset, height-markerSize-markerOffset, markers.BL)
 	drawMarker(width-markerSize-markerOffset, height-markerSize-markerOffset, markers.BR)
 
+	// Кодируем текущий blockSize в метаданных (рядом с TL маркером)
+	// blockSize 2..15 кодируется индексом палитры 0..13
+	metaColorIdx := blockSize - 2
+	if metaColorIdx < 0 {
+		metaColorIdx = 0
+	}
+	if metaColorIdx > 15 {
+		metaColorIdx = 15
+	}
+	cMeta := DataPalette[metaColorIdx]
+	for dy := 0; dy < 4; dy++ {
+		for dx := 0; dx < 4; dx++ {
+			img.SetRGBA(16+dx, 4+dy, cMeta)
+		}
+	}
+
 	// Рисуем Timing Patterns (пунктирные линии для синхронизации)
 	// Горизонтальная линия сверху (y=1)
 	for x := 64; x < width-64; x += 8 {
@@ -385,11 +488,11 @@ func Encode(data []byte, margin int) *image.RGBA {
 		}
 	}
 
-	// Подготовка данных с избыточностью
+	// Подготовка данных с Reed-Solomon (nsym=32)
 	dataLen := len(data)
-	// Блок: [Версия 0x03][Длина 2][Данные][CRC32 4]
+	// Блок: [Версия 0x04][Длина 2][Данные][CRC32 4]
 	header := []byte{
-		0x03,
+		0x04,
 		byte(dataLen >> 8),
 		byte(dataLen),
 	}
@@ -397,8 +500,8 @@ func Encode(data []byte, margin int) *image.RGBA {
 	c32 := crc32.ChecksumIEEE(block)
 	block = append(block, byte(c32>>24), byte(c32>>16), byte(c32>>8), byte(c32))
 
-	// Создаем две копии блока для избыточности
-	fullData := append(block, block...)
+	// Добавляем RS-коды (32 байта)
+	fullData := rsEncode(block, 32)
 
 	// Маскирование (XOR с шахматным паттерном) для улучшения JPEG-сжатия
 	for i := 0; i < len(fullData); i++ {
@@ -462,6 +565,34 @@ func Decode(img *image.RGBA, margin int) []byte {
 		return nil
 	}
 
+	// Читаем blockSize из метаданных (16, 4)
+	var sumRM, sumGM, sumBM uint32
+	for dy := 0; dy < 4; dy++ {
+		for dx := 0; dx < 4; dx++ {
+			c := img.RGBAAt(offsetX+16+dx, offsetY+4+dy)
+			sumRM += uint32(c.R)
+			sumGM += uint32(c.G)
+			sumBM += uint32(c.B)
+		}
+	}
+	avgColorM := color.RGBA{uint8(sumRM / 16), uint8(sumGM / 16), uint8(sumBM / 16), 255}
+	minDistM := 1000000
+	bestIdxM := 0
+	for i, pc := range DataPalette {
+		dr := int(avgColorM.R) - int(pc.R)
+		dg := int(avgColorM.G) - int(pc.G)
+		db := int(avgColorM.B) - int(pc.B)
+		dist := dr*dr + dg*dg + db*db
+		if dist < minDistM {
+			minDistM = dist
+			bestIdxM = i
+		}
+	}
+	effectiveBlockSize := bestIdxM + 2
+	if effectiveBlockSize < 2 || effectiveBlockSize > 16 {
+		effectiveBlockSize = blockSize // Fallback to global
+	}
+
 	// Координаты центров маркеров для трансформации
 	rx, ry := float64(offsetX+markerOffset+markerSize/2), float64(offsetY+markerOffset+markerSize/2)
 	gx, gy := float64(offsetX+width-markerOffset-markerSize/2), float64(offsetY+markerOffset+markerSize/2)
@@ -469,26 +600,19 @@ func Decode(img *image.RGBA, margin int) []byte {
 	qx, qy := float64(offsetX+width-markerOffset-markerSize/2), float64(offsetY+height-markerOffset-markerSize/2)
 
 	// Функция для билинейной интерполяции координат
-	// u, v - идеальные координаты в сетке 640x480
 	transform := func(u, v float64) (float64, float64) {
-		// Нормализуем координаты к [0, 1] относительно центров маркеров
-		// Центры находятся в 8, 8 (TL) и т.д. при markerOffset=4, markerSize=8
 		distX := float64(width - markerSize - 2*markerOffset)
 		distY := float64(height - markerSize - 2*markerOffset)
-
 		fu := (u - float64(markerOffset+markerSize/2)) / distX
 		fv := (v - float64(markerOffset+markerSize/2)) / distY
-
-		// Билинейная интерполяция
 		x := rx*(1-fu)*(1-fv) + gx*fu*(1-fv) + bx*(1-fu)*fv + qx*fu*fv
 		y := ry*(1-fu)*(1-fv) + gy*fu*(1-fv) + by*(1-fu)*fv + qy*fu*fv
 		return x, y
 	}
 
 	var bits []bool
-	for y := margin; y <= height-margin-blockSize; y += blockSize {
-		for x := margin; x <= width-margin-blockSize; x += blockSize {
-			// Пропускаем контрольные точки и Timing Patterns (как в Encode)
+	for y := margin; y <= height-margin-effectiveBlockSize; y += effectiveBlockSize {
+		for x := margin; x <= width-margin-effectiveBlockSize; x += effectiveBlockSize {
 			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
 				continue
 			}
@@ -496,14 +620,17 @@ func Decode(img *image.RGBA, margin int) []byte {
 				continue
 			}
 
-			// Сэмплируем блок 3x3 в центре для устойчивости к шуму
+			// Сэмплируем центр блока
 			var sumR, sumG, sumB uint32
 			points := 0
-			for dy := -1; dy <= 1; dy++ {
-				for dx := -1; dx <= 1; dx++ {
-					pxReal, pyReal := transform(float64(x)+float64(blockSize)/2.0+float64(dx), float64(y)+float64(blockSize)/2.0+float64(dy))
+			sampleSize := 1
+			if effectiveBlockSize >= 6 {
+				sampleSize = 2
+			}
+			for dy := -sampleSize; dy <= sampleSize; dy++ {
+				for dx := -sampleSize; dx <= sampleSize; dx++ {
+					pxReal, pyReal := transform(float64(x)+float64(effectiveBlockSize)/2.0+float64(dx), float64(y)+float64(effectiveBlockSize)/2.0+float64(dy))
 					px, py := int(pxReal), int(pyReal)
-
 					if px >= 0 && px < img.Bounds().Dx() && py >= 0 && py < img.Bounds().Dy() {
 						c := img.RGBAAt(px, py)
 						sumR += uint32(c.R)
@@ -516,20 +643,16 @@ func Decode(img *image.RGBA, margin int) []byte {
 
 			if points > 0 {
 				avgColor := color.RGBA{uint8(sumR / uint32(points)), uint8(sumG / uint32(points)), uint8(sumB / uint32(points)), 255}
-				// Находим ближайший цвет в палитре
 				minDist := 1000000
 				bestIdx := 0
 				for i, pc := range DataPalette {
-					dr := int(avgColor.R) - int(pc.R)
-					dg := int(avgColor.G) - int(pc.G)
-					db := int(avgColor.B) - int(pc.B)
+					dr, dg, db := int(avgColor.R)-int(pc.R), int(avgColor.G)-int(pc.G), int(avgColor.B)-int(pc.B)
 					dist := dr*dr + dg*dg + db*db
 					if dist < minDist {
 						minDist = dist
 						bestIdx = i
 					}
 				}
-				// Из индекса получаем bitsPerBlock бит
 				for i := 0; i < bitsPerBlock; i++ {
 					bits = append(bits, (bestIdx>>uint(bitsPerBlock-1-i))&1 == 1)
 				}
@@ -541,10 +664,6 @@ func Decode(img *image.RGBA, margin int) []byte {
 		}
 	}
 
-	if len(bits) < 16 {
-		return nil
-	}
-
 	// Собираем байты
 	var fullData []byte
 	for i := 0; i+8 <= len(bits); i += 8 {
@@ -554,53 +673,47 @@ func Decode(img *image.RGBA, margin int) []byte {
 				b |= 1 << uint(7-j)
 			}
 		}
-		// Снимаем маску
-		b ^= 0xAA
+		b ^= 0xAA // Снимаем маску
 		fullData = append(fullData, b)
 	}
 
-	if len(fullData) < 5 {
+	if len(fullData) < 255 {
 		return nil
 	}
 
-	// Пробуем найти валидный блок в данных (у нас их 2)
-	tryBlock := func(d []byte) []byte {
-		if len(d) < 7 {
-			return nil
-		}
-		if d[0] != 0x03 {
-			return nil
-		}
-		dataLen := int(d[1])<<8 | int(d[2])
-		if dataLen < 0 || dataLen > 8000 {
-			return nil
-		}
-		if dataLen+7 > len(d) {
-			return nil
-		}
-
-		expectedC32 := binary.BigEndian.Uint32(d[3+dataLen : 7+dataLen])
-		actualC32 := crc32.ChecksumIEEE(d[:3+dataLen])
-		if expectedC32 == actualC32 {
-			return d[3 : 3+dataLen]
-		}
+	// 1. Декодируем первый блок, чтобы узнать длину данных
+	decodedFirst, ok := rsDecode(fullData[:255], 32)
+	if !ok {
 		return nil
 	}
 
-	// Первая копия
-	res := tryBlock(fullData)
-	if res != nil {
-		return res
+	if len(decodedFirst) < 3 || (decodedFirst[0] != 0x04 && decodedFirst[0] != 0x03) {
+		return nil
 	}
 
-	// Вторая копия (ищем где она начинается)
-	for offset := 1; offset < len(fullData)-7; offset++ {
-		if fullData[offset] == 0x03 {
-			res = tryBlock(fullData[offset:])
-			if res != nil {
-				return res
-			}
-		}
+	dataLen := int(decodedFirst[1])<<8 | int(decodedFirst[2])
+	// blockDataLen = 223
+	numBlocks := (dataLen + 7 + 222) / 223
+	totalEncodedLen := numBlocks * 255
+
+	if len(fullData) < totalEncodedLen {
+		return nil
+	}
+
+	// 2. Декодируем все необходимые блоки
+	decoded, ok := rsDecode(fullData[:totalEncodedLen], 32)
+	if !ok {
+		return nil
+	}
+
+	if len(decoded) < 7 {
+		return nil
+	}
+
+	payload := decoded[3 : 3+dataLen]
+	receivedCRC := binary.BigEndian.Uint32(decoded[3+dataLen : 7+dataLen])
+	if crc32.ChecksumIEEE(decoded[:3+dataLen]) == receivedCRC {
+		return payload
 	}
 
 	return nil

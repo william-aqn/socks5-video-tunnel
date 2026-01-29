@@ -538,6 +538,8 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 
 	lastFPSIncrease := time.Now()
 	lastHeartbeat := time.Now()
+	lastBlockSizeChange := time.Now()
+	retransmitCount := 0
 
 	var activityMu sync.Mutex
 	lastActivity := time.Now()
@@ -608,6 +610,20 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 					lastFPSIncrease = time.Now()
 					log.Printf("Tunnel: Ramping down to %d FPS (remote confirmed only %d FPS)", fpsLevels[fpsIdx], remRecv)
 				}
+
+				// Адаптивный размер блока
+				if time.Since(lastBlockSizeChange) > 10*time.Second {
+					if retransmitCount > 10 && blockSize < 12 {
+						blockSize += 2
+						lastBlockSizeChange = time.Now()
+						log.Printf("Adaptive: Increasing blockSize to %d due to errors (%d retransmits)", blockSize, retransmitCount)
+					} else if retransmitCount == 0 && remRecv >= fps && blockSize > 4 {
+						blockSize -= 1
+						lastBlockSizeChange = time.Now()
+						log.Printf("Adaptive: Decreasing blockSize to %d (stable link)", blockSize)
+					}
+					retransmitCount = 0
+				}
 			}
 
 			rs.mu.Lock()
@@ -616,6 +632,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			if len(rs.unacked) > 0 && time.Since(lastRetransmit) > 1*time.Second {
 				packetToResend = rs.unacked[0]
 				lastRetransmit = time.Now()
+				retransmitCount++
 			}
 			windowFull := len(rs.unacked) >= 20
 			rs.mu.Unlock()
