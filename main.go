@@ -193,7 +193,7 @@ func main() {
 			finalBlockSize = 6
 		}
 	}
-	blockSize = finalBlockSize
+	SetBlockSize(finalBlockSize)
 
 	finalHB := 30
 	if loadedCfg != nil && loadedCfg.HeartbeatInterval > 0 {
@@ -299,7 +299,7 @@ func main() {
 		fmt.Println("Virtual camera system initialized.")
 		vcam = cam
 		// Отправим пустой кадр для инициализации MJPEG сервера
-		sendEncodedPacket(nil, finalMargin)
+		sendEncodedPacket(nil, finalMargin, GetBlockSize())
 		defer cam.Close()
 	}
 
@@ -383,6 +383,13 @@ func main() {
 				time.Sleep(2 * time.Second)
 			}
 		}
+	}()
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL PANIC in main: %v", r)
+		}
+		log.Printf("--- %s session ended ---", *mode)
 	}()
 
 	switch *mode {

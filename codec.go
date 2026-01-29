@@ -6,6 +6,9 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
+	"log"
+	"sync"
+	"time"
 )
 
 const (
@@ -17,7 +20,63 @@ const (
 	markerOffset  = 4
 )
 
-var blockSize = 4
+var (
+	blockSize    = 4
+	lastBSChange = time.Now()
+	bsMu         sync.Mutex
+)
+
+func GetBlockSize() int {
+	bsMu.Lock()
+	defer bsMu.Unlock()
+	return blockSize
+}
+
+func SetBlockSize(s int) {
+	bsMu.Lock()
+	defer bsMu.Unlock()
+	blockSize = s
+	lastBSChange = time.Now()
+}
+
+func TryIncreaseBlockSize() {
+	bsMu.Lock()
+	defer bsMu.Unlock()
+	if time.Since(lastBSChange) > 10*time.Second && blockSize < 12 {
+		blockSize += 2
+		lastBSChange = time.Now()
+		log.Printf("Adaptive: Global blockSize increased to %d", blockSize)
+	}
+}
+
+func TryDecreaseBlockSize() {
+	bsMu.Lock()
+	defer bsMu.Unlock()
+	if time.Since(lastBSChange) > 10*time.Second && blockSize > 4 {
+		blockSize -= 1
+		lastBSChange = time.Now()
+		log.Printf("Adaptive: Global blockSize decreased to %d", blockSize)
+	}
+}
+
+func calculateMaxBits(margin int, bSize int) int {
+	if bSize < 1 {
+		bSize = 4
+	}
+	totalBits := 0
+	for y := margin; y <= height-margin-bSize; y += bSize {
+		for x := margin; x <= width-margin-bSize; x += bSize {
+			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
+				continue
+			}
+			if x < 6 || y < 6 {
+				continue
+			}
+			totalBits += bitsPerBlock
+		}
+	}
+	return totalBits
+}
 
 type ColorRange struct {
 	rMin, rMax, gMin, gMax, bMin, bMax int
@@ -91,21 +150,8 @@ func matchRange(r, g, b uint8, cr ColorRange) bool {
 }
 
 // GetMaxPayloadSize возвращает максимальное количество байт, которое можно закодировать в одном кадре.
-func GetMaxPayloadSize(margin int) int {
-	totalBits := 0
-	for y := margin; y <= height-margin-blockSize; y += blockSize {
-		for x := margin; x <= width-margin-blockSize; x += blockSize {
-			// Пропускаем контрольные точки (зона 16x16 для стабильности поиска)
-			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
-				continue
-			}
-			// Пропускаем Timing Patterns (они на краях x=1, y=1)
-			if x < 6 || y < 6 {
-				continue
-			}
-			totalBits += bitsPerBlock
-		}
-	}
+func GetMaxPayloadSize(margin int, bSize int) int {
+	totalBits := calculateMaxBits(margin, bSize)
 	totalBytes := totalBits / 8
 	// Мы используем RS(255, 223), то есть каждые 255 байт на экране содержат 223 байта данных.
 	numRSBlocks := totalBytes / 255
@@ -414,7 +460,51 @@ func crc8(data []byte) byte {
 }
 
 // Encode записывает данные в пиксели изображения.
-func Encode(data []byte, margin int) *image.RGBA {
+func Encode(data []byte, margin int, bSize int) *image.RGBA {
+	if bSize < 1 {
+		bSize = 4
+	}
+
+	// Подготовка данных с Reed-Solomon (nsym=32)
+	dataLen := len(data)
+	// Блок: [Версия 0x04][Длина 2][Данные][CRC32 4]
+	header := []byte{
+		0x04,
+		byte(dataLen >> 8),
+		byte(dataLen),
+	}
+	block := append(header, data...)
+	c32 := crc32.ChecksumIEEE(block)
+	block = append(block, byte(c32>>24), byte(c32>>16), byte(c32>>8), byte(c32))
+
+	// Добавляем RS-коды (32 байта)
+	fullData := rsEncode(block, 32)
+
+	// Маскирование (XOR с шахматным паттерном) для улучшения JPEG-сжатия
+	for i := 0; i < len(fullData); i++ {
+		fullData[i] ^= 0xAA // Простая маска
+	}
+
+	// Превращаем данные в поток бит
+	bits := make([]bool, 0, len(fullData)*8)
+	for _, b := range fullData {
+		for i := 7; i >= 0; i-- {
+			bits = append(bits, (b>>uint(i))&1 == 1)
+		}
+	}
+
+	// Автоматически подбираем bSize, если данные не влезают
+	originalBSize := bSize
+	for bSize > 2 {
+		if len(bits) <= calculateMaxBits(margin, bSize) {
+			break
+		}
+		bSize--
+	}
+	if bSize != originalBSize {
+		log.Printf("Encode: Auto-adjusted blockSize from %d to %d to fit %d bits", originalBSize, bSize, len(bits))
+	}
+
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
 	// Заполняем фон черным
@@ -446,9 +536,9 @@ func Encode(data []byte, margin int) *image.RGBA {
 	drawMarker(markerOffset, height-markerSize-markerOffset, markers.BL)
 	drawMarker(width-markerSize-markerOffset, height-markerSize-markerOffset, markers.BR)
 
-	// Кодируем текущий blockSize в метаданных (рядом с TL маркером)
-	// blockSize 2..15 кодируется индексом палитры 0..13
-	metaColorIdx := blockSize - 2
+	// Кодируем текущий bSize в метаданных (рядом с TL маркером)
+	// bSize 2..15 кодируется индексом палитры 0..13
+	metaColorIdx := bSize - 2
 	if metaColorIdx < 0 {
 		metaColorIdx = 0
 	}
@@ -488,37 +578,9 @@ func Encode(data []byte, margin int) *image.RGBA {
 		}
 	}
 
-	// Подготовка данных с Reed-Solomon (nsym=32)
-	dataLen := len(data)
-	// Блок: [Версия 0x04][Длина 2][Данные][CRC32 4]
-	header := []byte{
-		0x04,
-		byte(dataLen >> 8),
-		byte(dataLen),
-	}
-	block := append(header, data...)
-	c32 := crc32.ChecksumIEEE(block)
-	block = append(block, byte(c32>>24), byte(c32>>16), byte(c32>>8), byte(c32))
-
-	// Добавляем RS-коды (32 байта)
-	fullData := rsEncode(block, 32)
-
-	// Маскирование (XOR с шахматным паттерном) для улучшения JPEG-сжатия
-	for i := 0; i < len(fullData); i++ {
-		fullData[i] ^= 0xAA // Простая маска
-	}
-
-	// Превращаем данные в поток бит
-	bits := make([]bool, 0, len(fullData)*8)
-	for _, b := range fullData {
-		for i := 7; i >= 0; i-- {
-			bits = append(bits, (b>>uint(i))&1 == 1)
-		}
-	}
-
 	bitIdx := 0
-	for y := margin; y <= height-margin-blockSize; y += blockSize {
-		for x := margin; x <= width-margin-blockSize; x += blockSize {
+	for y := margin; y <= height-margin-bSize; y += bSize {
+		for x := margin; x <= width-margin-bSize; x += bSize {
 			// Пропускаем контрольные точки (зона 16x16 для стабильности поиска)
 			if (x < 16 && y < 16) || (x >= width-16 && y < 16) || (x < 16 && y >= height-16) || (x >= width-16 && y >= height-16) {
 				continue
@@ -540,8 +602,8 @@ func Encode(data []byte, margin int) *image.RGBA {
 				c := DataPalette[val]
 
 				// Рисуем блок
-				for dy := 0; dy < blockSize; dy++ {
-					for dx := 0; dx < blockSize; dx++ {
+				for dy := 0; dy < bSize; dy++ {
+					for dx := 0; dx < bSize; dx++ {
 						img.SetRGBA(x+dx, y+dy, c)
 					}
 				}
@@ -590,7 +652,7 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 	effectiveBlockSize := bestIdxM + 2
 	if effectiveBlockSize < 2 || effectiveBlockSize > 16 {
-		effectiveBlockSize = blockSize // Fallback to global
+		effectiveBlockSize = GetBlockSize() // Fallback to global
 	}
 
 	// Координаты центров маркеров для трансформации
@@ -692,21 +754,20 @@ func Decode(img *image.RGBA, margin int) []byte {
 	}
 
 	dataLen := int(decodedFirst[1])<<8 | int(decodedFirst[2])
+	if dataLen > 16384 { // Разумный предел для одного кадра
+		return nil
+	}
 	// blockDataLen = 223
 	numBlocks := (dataLen + 7 + 222) / 223
 	totalEncodedLen := numBlocks * 255
 
-	if len(fullData) < totalEncodedLen {
+	if len(fullData) < totalEncodedLen || totalEncodedLen <= 0 {
 		return nil
 	}
 
 	// 2. Декодируем все необходимые блоки
 	decoded, ok := rsDecode(fullData[:totalEncodedLen], 32)
-	if !ok {
-		return nil
-	}
-
-	if len(decoded) < 7 {
+	if !ok || len(decoded) < 3+dataLen+4 {
 		return nil
 	}
 

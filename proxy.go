@@ -75,7 +75,7 @@ var (
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 4096)
+		return make([]byte, 16384)
 	},
 }
 
@@ -127,9 +127,12 @@ func getTrafficStats() (sentKBs, recvKBs float64) {
 	return lastSentKBs, lastRecvKBs
 }
 
-func sendEncodedPacket(payload []byte, margin int) {
+func sendEncodedPacket(payload []byte, margin int, bSize int) {
+	if bSize < 1 {
+		bSize = GetBlockSize()
+	}
 	recordTrafficSent(len(payload))
-	writeToVCam(Encode(payload, margin), margin)
+	writeToVCam(Encode(payload, margin, bSize), margin)
 }
 
 func recordSentPacket(t byte) {
@@ -292,24 +295,31 @@ func (pd *PacketDispatcher) Run(video *ScreenVideoConn, margin int) {
 	frameSize := captureWidth * captureHeight * 4
 	buf := make([]byte, frameSize)
 	for {
-		startTime := time.Now()
-		_, err := io.ReadFull(video, buf)
-		if err != nil {
-			log.Printf("Dispatcher: screen read error: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		recordFrameProcess(time.Since(startTime))
-		img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
-		data := Decode(img, margin)
-		if data != nil && len(data) > 0 {
-			recordTrafficRecv(len(data))
-			recordRecvFrame()
-			UpdateCaptureStatus(true)
-			pd.Dispatch(data)
-		} else {
-			UpdateCaptureStatus(false)
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC in PacketDispatcher loop: %v", r)
+				}
+			}()
+			startTime := time.Now()
+			_, err := io.ReadFull(video, buf)
+			if err != nil {
+				log.Printf("Dispatcher: screen read error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				return
+			}
+			recordFrameProcess(time.Since(startTime))
+			img := &image.RGBA{Pix: buf, Stride: captureWidth * 4, Rect: image.Rect(0, 0, captureWidth, captureHeight)}
+			data := Decode(img, margin)
+			if data != nil && len(data) > 0 {
+				recordTrafficRecv(len(data))
+				recordRecvFrame()
+				UpdateCaptureStatus(true)
+				pd.Dispatch(data)
+			} else {
+				UpdateCaptureStatus(false)
+			}
+		}()
 	}
 }
 
@@ -475,7 +485,7 @@ func vcamIdleHandler() {
 		if !vcamCleared && !vcamLastWrite.IsZero() && time.Since(vcamLastWrite) > 500*time.Millisecond {
 			if vcam != nil {
 				// Кодируем пустой кадр для очистки экрана
-				img := Encode(nil, vcamGlobalMargin)
+				img := Encode(nil, vcamGlobalMargin, GetBlockSize())
 				vcam.WriteFrame(img)
 			}
 			vcamCleared = true
@@ -493,7 +503,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	sendDisconnect := func() {
 		closeOnce.Do(func() {
 			payload := []byte{typeDisconnect, byte(connID >> 8), byte(connID)}
-			sendEncodedPacket(payload, margin)
+			sendEncodedPacket(payload, margin, blockSize)
 			recordSentPacket(typeDisconnect)
 		})
 	}
@@ -554,6 +564,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	// Data -> Video (Sender)
 	go func() {
 		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in Data->Video (ID: %d): %v", connID, r)
+			}
 			log.Printf("Tunnel: Exit Data->Video goroutine (ID: %d)", connID)
 			sendDisconnect()
 			dataConn.Close()
@@ -561,6 +574,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 		}()
 		for {
 			fps := fpsLevels[fpsIdx]
+			bSize := GetBlockSize()
 			sendInterval := time.Second / time.Duration(fps)
 			loopStart := time.Now()
 
@@ -593,7 +607,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				}
 				hbBytes, _ := json.Marshal(hb)
 				payload := append([]byte{typeHeartbeat}, hbBytes...)
-				sendEncodedPacket(payload, margin)
+				sendEncodedPacket(payload, margin, bSize)
 				recordSentPacket(typeHeartbeat)
 				lastHeartbeat = time.Now()
 
@@ -613,16 +627,13 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 
 				// Адаптивный размер блока
 				if time.Since(lastBlockSizeChange) > 10*time.Second {
-					if retransmitCount > 10 && blockSize < 12 {
-						blockSize += 2
-						lastBlockSizeChange = time.Now()
-						log.Printf("Adaptive: Increasing blockSize to %d due to errors (%d retransmits)", blockSize, retransmitCount)
-					} else if retransmitCount == 0 && remRecv >= fps && blockSize > 4 {
-						blockSize -= 1
-						lastBlockSizeChange = time.Now()
-						log.Printf("Adaptive: Decreasing blockSize to %d (stable link)", blockSize)
+					if retransmitCount > 10 {
+						TryIncreaseBlockSize()
+					} else if retransmitCount == 0 && remRecv >= fps {
+						TryDecreaseBlockSize()
 					}
 					retransmitCount = 0
+					lastBlockSizeChange = time.Now()
 				}
 			}
 
@@ -637,15 +648,15 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			windowFull := len(rs.unacked) >= 20
 			rs.mu.Unlock()
 
-			maxData := GetMaxPayloadSize(margin) - 5
-			if maxData > 4000 {
-				maxData = 4000
-			}
+			maxData := GetMaxPayloadSize(margin, bSize) - 5
 			if maxData < 10 {
 				maxData = 10
 			}
 
 			buf := getBuffer()
+			if maxData > len(buf) {
+				maxData = len(buf)
+			}
 			n := 0
 			var err error
 
@@ -694,7 +705,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 					payload[4] = myAck
 				}
 
-				sendEncodedPacket(payload, margin)
+				sendEncodedPacket(payload, margin, bSize)
 				recordSentPacket(typeData)
 
 				rs.mu.Lock()
@@ -731,6 +742,9 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	// Video -> Data (Receiver)
 	go func() {
 		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in Video->Data (ID: %d): %v", connID, r)
+			}
 			log.Printf("Tunnel: Exit Video->Data goroutine (ID: %d)", connID)
 			sendDisconnect()
 			dataConn.Close()
@@ -850,7 +864,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
-		sendEncodedPacket(nil, margin)
+		sendEncodedPacket(nil, margin, blockSize)
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -938,7 +952,7 @@ func RunScreenSocksServer(x, y, margin int) {
 								default:
 									resp := SyncData{SessionID: video.SessionID, Random: generateRandomString(32), MeasuredFPS: fps}
 									respBytes, _ := json.Marshal(resp)
-									sendEncodedPacket(append([]byte{typeSync}, respBytes...), margin)
+									sendEncodedPacket(append([]byte{typeSync}, respBytes...), margin, blockSize)
 									recordSentPacket(typeSync)
 									time.Sleep(10 * time.Millisecond) // Max rate 100 FPS
 								}
@@ -1004,7 +1018,7 @@ func RunScreenSocksServer(x, y, margin int) {
 					Phase:        0,
 				}
 				hbBytes, _ := json.Marshal(resp)
-				sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin)
+				sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, blockSize)
 				recordSentPacket(typeHeartbeat)
 			}
 
@@ -1043,7 +1057,7 @@ func RunScreenSocksServer(x, y, margin int) {
 					payload[3] = socks5RespSuccess
 					payload[4] = socks5AtypIPv4
 					// остальное нули
-					sendEncodedPacket(payload, margin)
+					sendEncodedPacket(payload, margin, blockSize)
 					recordSentPacket(typeConnAck)
 					return
 				}
@@ -1097,7 +1111,7 @@ func RunScreenSocksServer(x, y, margin int) {
 				payload[4] = atyp
 				copy(payload[5:], boundAddr)
 				binary.BigEndian.PutUint16(payload[5+len(boundAddr):], port)
-				sendEncodedPacket(payload, margin)
+				sendEncodedPacket(payload, margin, blockSize)
 				recordSentPacket(typeConnAck)
 
 				if err == nil {
@@ -1155,7 +1169,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 					return
 				default:
 					syncPayload, _ := json.Marshal(SyncData{SessionID: sid, Random: generateRandomString(32)})
-					sendEncodedPacket(append([]byte{typeSync}, syncPayload...), margin)
+					sendEncodedPacket(append([]byte{typeSync}, syncPayload...), margin, blockSize)
 					recordSentPacket(typeSync)
 					time.Sleep(10 * time.Millisecond)
 				}
@@ -1195,7 +1209,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 							scd := SyncCompleteData{SessionID: video.SessionID, FPS: calculatedFPS}
 							scdBytes, _ := json.Marshal(scd)
 							for i := 0; i < 5; i++ { // Отправляем несколько раз для надежности
-								sendEncodedPacket(append([]byte{typeSyncComplete}, scdBytes...), margin)
+								sendEncodedPacket(append([]byte{typeSyncComplete}, scdBytes...), margin, blockSize)
 								recordSentPacket(typeSyncComplete)
 								time.Sleep(50 * time.Millisecond)
 							}
@@ -1272,7 +1286,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						Seq:          hbSeq,
 					}
 					hbBytes, _ := json.Marshal(hb)
-					sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin)
+					sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, blockSize)
 					recordSentPacket(typeHeartbeat)
 				}
 			}
@@ -1305,7 +1319,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 				ch := pd.Register(connID)
 				defer pd.Unregister(connID)
 
-				sendEncodedPacket(payload, margin)
+				sendEncodedPacket(payload, margin, blockSize)
 				recordSentPacket(typeConnect)
 
 				success := false
@@ -1339,7 +1353,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						}
 					case <-timer:
 						// Повторная отправка CONNECT если нет ответа 3 секунды
-						sendEncodedPacket(payload, margin)
+						sendEncodedPacket(payload, margin, blockSize)
 						recordSentPacket(typeConnect)
 						timer = time.After(5 * time.Second)
 					case <-overallTimer:
