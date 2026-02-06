@@ -23,6 +23,7 @@ const (
 	typeDisconnect   = 0x04
 	typeSync         = 0x05
 	typeSyncComplete = 0x06
+	typeNack         = 0x07
 )
 
 type HeartbeatData struct {
@@ -165,6 +166,8 @@ func getSentStatsAndReset() string {
 			typeName = "SYNC_DONE"
 		case typeDisconnect:
 			typeName = "DISCONNECT"
+		case typeNack:
+			typeName = "NACK"
 		}
 		res += fmt.Sprintf("%s:%d ", typeName, count)
 		sentStats[t] = 0
@@ -245,7 +248,7 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 		case pd.syncCompCh <- data:
 		default:
 		}
-	case typeData, typeConnAck, typeDisconnect:
+	case typeData, typeConnAck, typeDisconnect, typeNack:
 		if len(data) >= 3 {
 			id := uint16(data[1])<<8 | uint16(data[2])
 			pd.mu.RLock()
@@ -256,8 +259,13 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 				select {
 				case ch <- data:
 				default:
-					if data[0] == typeData {
-						log.Printf("Dispatcher: DROPPING DATA packet for connID %d (buffer full)", id)
+					if data[0] == typeData || data[0] == typeNack {
+						log.Printf("Dispatcher: DROPPING %s packet for connID %d (buffer full)", func() string {
+							if data[0] == typeData {
+								return "DATA"
+							}
+							return "NACK"
+						}(), id)
 					}
 				}
 			} else {
@@ -265,8 +273,13 @@ func (pd *PacketDispatcher) Dispatch(data []byte) {
 					return
 				}
 				// Пакет для неизвестного или уже закрытого соединения
-				if data[0] == typeData {
-					log.Printf("Dispatcher: Data for unknown connID %d (len: %d), NOT sending DISCONNECT back (disabled)", id, len(data))
+				if data[0] == typeData || data[0] == typeNack {
+					log.Printf("Dispatcher: %s for unknown connID %d (len: %d), NOT sending DISCONNECT back (disabled)", func() string {
+						if data[0] == typeData {
+							return "Data"
+						}
+						return "Nack"
+					}(), id, len(data))
 				} else if data[0] == typeDisconnect {
 					log.Printf("Dispatcher: Disconnect for already unknown connID %d", id)
 				}
@@ -503,7 +516,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	sendDisconnect := func() {
 		closeOnce.Do(func() {
 			payload := []byte{typeDisconnect, byte(connID >> 8), byte(connID)}
-			sendEncodedPacket(payload, margin, blockSize)
+			sendEncodedPacket(payload, margin, GetBlockSize())
 			recordSentPacket(typeDisconnect)
 		})
 	}
@@ -517,10 +530,13 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 		unacked         []*tunnelPacket
 		nextExpectedSeq byte
 		recvBuf         map[byte][]byte
+		nackQueue       []byte             // Sequences requested by remote
+		lastNackTime    map[byte]time.Time // When we last sent NACK for a seq
 	}
 	rs := &reliableState{
 		nextExpectedSeq: 1,
 		recvBuf:         make(map[byte][]byte),
+		lastNackTime:    make(map[byte]time.Time),
 	}
 
 	var lastSentSeq byte = 0
@@ -611,10 +627,6 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				recordSentPacket(typeHeartbeat)
 				lastHeartbeat = time.Now()
 
-				activityMu.Lock()
-				lastActivity = time.Now()
-				activityMu.Unlock()
-
 				if remRecv >= fps && fpsIdx < len(fpsLevels)-1 && time.Since(lastFPSIncrease) > 5*time.Second {
 					fpsIdx++
 					lastFPSIncrease = time.Now()
@@ -640,7 +652,22 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			rs.mu.Lock()
 			myAck := rs.lastRevSeq
 			var packetToResend *tunnelPacket
-			if len(rs.unacked) > 0 && time.Since(lastRetransmit) > 1*time.Second {
+
+			// Приоритет NACK
+			if len(rs.nackQueue) > 0 {
+				nackSeq := rs.nackQueue[0]
+				rs.nackQueue = rs.nackQueue[1:]
+				for _, p := range rs.unacked {
+					if p.seq == nackSeq {
+						packetToResend = p
+						// log.Printf("Tunnel: NACK retransmit (ID: %d, seq: %d)", connID, nackSeq)
+						break
+					}
+				}
+			}
+
+			// Обычный таймаут ретрансляции
+			if packetToResend == nil && len(rs.unacked) > 0 && time.Since(lastRetransmit) > 1*time.Second {
 				packetToResend = rs.unacked[0]
 				lastRetransmit = time.Now()
 				retransmitCount++
@@ -660,7 +687,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 			n := 0
 			var err error
 
-			if !windowFull && packetToResend == nil {
+			if !windowFull {
 				if tc, ok := dataConn.(interface{ SetReadDeadline(time.Time) error }); ok {
 					tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 				}
@@ -695,10 +722,6 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 					rs.unacked = append(rs.unacked, p)
 					rs.mu.Unlock()
 					bytesSent += int64(n)
-
-					activityMu.Lock()
-					lastActivity = time.Now()
-					activityMu.Unlock()
 				} else {
 					// ACK only
 					payload[3] = 0
@@ -773,6 +796,11 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 				seq := data[3]
 				ack := data[4]
 
+				// Любой пакет (Data, Ack) обновляет активность
+				activityMu.Lock()
+				lastActivity = time.Now()
+				activityMu.Unlock()
+
 				// Handle ACK
 				rs.mu.Lock()
 				newUnacked := rs.unacked[:0]
@@ -825,20 +853,51 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 							}
 							rs.nextExpectedSeq = expected
 							rs.lastRevSeq = expected - 1
-
-							activityMu.Lock()
-							lastActivity = time.Now()
-							activityMu.Unlock()
 						} else {
 							// Out of order
 							if _, ok := rs.recvBuf[seq]; !ok {
 								rs.recvBuf[seq] = append([]byte(nil), data[5:]...)
 								log.Printf("Tunnel: Out of order (ID: %d): got %d, expected %d. Buffered.", connID, seq, expected)
+
+								// Send NACK for the expected packet
+								if time.Since(rs.lastNackTime[expected]) > 500*time.Millisecond {
+									nackPayload := []byte{typeNack, byte(connID >> 8), byte(connID), expected}
+									sendEncodedPacket(nackPayload, margin, GetBlockSize())
+									recordSentPacket(typeNack)
+									rs.lastNackTime[expected] = time.Now()
+								}
 							}
 						}
 					}
 					rs.mu.Unlock()
 				}
+			case typeNack:
+				if len(data) < 4 {
+					continue
+				}
+				id := uint16(data[1])<<8 | uint16(data[2])
+				if id != connID {
+					continue
+				}
+
+				activityMu.Lock()
+				lastActivity = time.Now()
+				activityMu.Unlock()
+
+				missingSeq := data[3]
+				rs.mu.Lock()
+				// Проверяем, нет ли уже такого seq в очереди NACK
+				alreadyInQueue := false
+				for _, s := range rs.nackQueue {
+					if s == missingSeq {
+						alreadyInQueue = true
+						break
+					}
+				}
+				if !alreadyInQueue {
+					rs.nackQueue = append(rs.nackQueue, missingSeq)
+				}
+				rs.mu.Unlock()
 			case typeHeartbeat:
 				var hb HeartbeatData
 				if err := json.Unmarshal(data[1:], &hb); err == nil {
@@ -846,6 +905,11 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 						log.Printf("Tunnel: Remote session ID changed (%d -> %d), closing tunnel", remoteSID, hb.SessionID)
 						return
 					}
+
+					activityMu.Lock()
+					lastActivity = time.Now()
+					activityMu.Unlock()
+
 					if hb.Seq != 0 && hb.Seq <= lastRemoteHBSeq && hb.SessionID == remoteSID {
 						continue
 					}
@@ -864,7 +928,7 @@ func runTunnelWithPrefix(dataConn io.ReadWriteCloser, video *ScreenVideoConn, ma
 	log.Printf("Tunnel: Closed. Sent: %d bytes, Received: %d bytes", bytesSent, bytesReceived)
 	// Очищаем VCam, чтобы не висел старый кадр
 	for i := 0; i < 3; i++ {
-		sendEncodedPacket(nil, margin, blockSize)
+		sendEncodedPacket(nil, margin, GetBlockSize())
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -952,7 +1016,7 @@ func RunScreenSocksServer(x, y, margin int) {
 								default:
 									resp := SyncData{SessionID: video.SessionID, Random: generateRandomString(32), MeasuredFPS: fps}
 									respBytes, _ := json.Marshal(resp)
-									sendEncodedPacket(append([]byte{typeSync}, respBytes...), margin, blockSize)
+									sendEncodedPacket(append([]byte{typeSync}, respBytes...), margin, GetBlockSize())
 									recordSentPacket(typeSync)
 									time.Sleep(10 * time.Millisecond) // Max rate 100 FPS
 								}
@@ -1018,7 +1082,7 @@ func RunScreenSocksServer(x, y, margin int) {
 					Phase:        0,
 				}
 				hbBytes, _ := json.Marshal(resp)
-				sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, blockSize)
+				sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, GetBlockSize())
 				recordSentPacket(typeHeartbeat)
 			}
 
@@ -1057,7 +1121,7 @@ func RunScreenSocksServer(x, y, margin int) {
 					payload[3] = socks5RespSuccess
 					payload[4] = socks5AtypIPv4
 					// остальное нули
-					sendEncodedPacket(payload, margin, blockSize)
+					sendEncodedPacket(payload, margin, GetBlockSize())
 					recordSentPacket(typeConnAck)
 					return
 				}
@@ -1111,7 +1175,7 @@ func RunScreenSocksServer(x, y, margin int) {
 				payload[4] = atyp
 				copy(payload[5:], boundAddr)
 				binary.BigEndian.PutUint16(payload[5+len(boundAddr):], port)
-				sendEncodedPacket(payload, margin, blockSize)
+				sendEncodedPacket(payload, margin, GetBlockSize())
 				recordSentPacket(typeConnAck)
 
 				if err == nil {
@@ -1169,7 +1233,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 					return
 				default:
 					syncPayload, _ := json.Marshal(SyncData{SessionID: sid, Random: generateRandomString(32)})
-					sendEncodedPacket(append([]byte{typeSync}, syncPayload...), margin, blockSize)
+					sendEncodedPacket(append([]byte{typeSync}, syncPayload...), margin, GetBlockSize())
 					recordSentPacket(typeSync)
 					time.Sleep(10 * time.Millisecond)
 				}
@@ -1209,7 +1273,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 							scd := SyncCompleteData{SessionID: video.SessionID, FPS: calculatedFPS}
 							scdBytes, _ := json.Marshal(scd)
 							for i := 0; i < 5; i++ { // Отправляем несколько раз для надежности
-								sendEncodedPacket(append([]byte{typeSyncComplete}, scdBytes...), margin, blockSize)
+								sendEncodedPacket(append([]byte{typeSyncComplete}, scdBytes...), margin, GetBlockSize())
 								recordSentPacket(typeSyncComplete)
 								time.Sleep(50 * time.Millisecond)
 							}
@@ -1286,7 +1350,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						Seq:          hbSeq,
 					}
 					hbBytes, _ := json.Marshal(hb)
-					sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, blockSize)
+					sendEncodedPacket(append([]byte{typeHeartbeat}, hbBytes...), margin, GetBlockSize())
 					recordSentPacket(typeHeartbeat)
 				}
 			}
@@ -1319,7 +1383,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 				ch := pd.Register(connID)
 				defer pd.Unregister(connID)
 
-				sendEncodedPacket(payload, margin, blockSize)
+				sendEncodedPacket(payload, margin, GetBlockSize())
 				recordSentPacket(typeConnect)
 
 				success := false
@@ -1353,7 +1417,7 @@ func RunScreenSocksClient(localListenAddr string, x, y, margin int) {
 						}
 					case <-timer:
 						// Повторная отправка CONNECT если нет ответа 3 секунды
-						sendEncodedPacket(payload, margin, blockSize)
+						sendEncodedPacket(payload, margin, GetBlockSize())
 						recordSentPacket(typeConnect)
 						timer = time.After(5 * time.Second)
 					case <-overallTimer:
